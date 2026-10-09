@@ -10,6 +10,7 @@ const { DemoBackend } = require('./lib/demoBackend');
 const { JsonStore } = require('./lib/store');
 const { Gateway } = require('./lib/bank/gateway');
 const { SevenPayClient, SevenPayDemo, SwapService } = require('./lib/sevenpay');
+const { Staff, ROLES } = require('./lib/staff');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -33,10 +34,16 @@ const MIME = {
  * options.corsOrigins — список origin, которым разрешены запросы (для веб-версии на другом домене).
  */
 function createApp(backend, options = {}) {
-    const sessions = new Map(); // token -> { password, expires }; пароль только в памяти сервера
+    const sessions = new Map(); // token -> { password, user, expires }; пароль только в памяти сервера
     const failures = new Map(); // ip -> { count, until } — защита от подбора пароля
     const store = options.store || new JsonStore(null, {});
     const gateway = new Gateway(backend, store);
+    const staff = new Staff(store);
+    // демо: готовые сотрудники и открытая смена, чтобы роли можно было опробовать сразу
+    if (options.demoStaff) {
+        for (const u of options.demoStaff.users) if (!store.data.staff.some((x) => x.login === u.login)) staff.create(u);
+        staff.openShift(options.demoStaff.walletPassword, staff.owner());
+    }
     // обменник 7Pay: options.sevenpay — клиент API (SevenPayClient или SevenPayDemo); без него раздел выключен
     const swap = options.sevenpay ? new SwapService(options.sevenpay, backend, store) : null;
     const requireSwap = () => {
@@ -45,9 +52,10 @@ function createApp(backend, options = {}) {
     };
     const corsOrigins = new Set(options.corsOrigins || []);
 
-    function openSession(password) {
+    // password — пароль кошелька (только у владельца), у сотрудника null: подпись идёт по открытой смене
+    function openSession(password, user) {
         const token = crypto.randomBytes(24).toString('hex');
-        sessions.set(token, { password, expires: Date.now() + SESSION_TTL_MS });
+        sessions.set(token, { password, user, expires: Date.now() + SESSION_TTL_MS });
         return token;
     }
 
@@ -59,8 +67,37 @@ function createApp(backend, options = {}) {
             sessions.delete(token);
             throw new BankError('Сессия истекла, войдите снова', 401);
         }
+        if (s.user.role !== 'owner') {
+            // отключённый или удалённый сотрудник теряет доступ сразу
+            const u = store.data.staff.find((x) => x.id === s.user.id);
+            if (!u || u.disabled) {
+                sessions.delete(token);
+                throw new BankError('Доступ отозван администратором', 401);
+            }
+            s.user = staff.public(u);
+        }
         s.expires = Date.now() + SESSION_TTL_MS;
-        return { token, password: s.password };
+        return {
+            token,
+            user: s.user,
+            raw: s,
+            // пароль кошелька для операции: свой у владельца, у сотрудника — открытой смены
+            get password() { return staff.walletPassword(s); },
+        };
+    }
+
+    // права на маршрут: GET — просмотр, остальное — по разделу; список прав — все обязательны
+    function permsFor(method, pathname) {
+        if (pathname === '/api/logout' || pathname === '/api/me') return [];
+        if (pathname.startsWith('/api/staff') || pathname.startsWith('/api/shift') || pathname === '/api/audit') return ['staff'];
+        if (pathname === '/api/bank/statement') return ['statements'];
+        if (pathname === '/api/bank/settings') return method === 'GET' ? ['gateway'] : ['settings'];
+        if (pathname.startsWith('/api/bank/')) {
+            if (/\/(credit|refund)$/.test(pathname)) return ['gateway', 'sign'];
+            return ['gateway'];
+        }
+        if (method === 'GET' || pathname === '/api/swap/quote') return ['read'];
+        return ['sign'];
     }
 
     function checkThrottle(ip) {
@@ -92,7 +129,8 @@ function createApp(backend, options = {}) {
         const raw = await readRaw(req);
         if (!raw.length) return {};
         try {
-            return JSON.parse(raw.toString('utf8'));
+            req.bankBody = JSON.parse(raw.toString('utf8')); // для журнала действий
+            return req.bankBody;
         } catch (e) {
             throw new BankError('Некорректный JSON');
         }
@@ -133,8 +171,20 @@ function createApp(backend, options = {}) {
         ['GET', '/api/status', () => backend.status(), { public: true }],
         ['POST', '/api/login', async ({ req, ip }) => {
             checkThrottle(ip);
-            const { password } = await readJson(req);
-            if (typeof password !== 'string' || !password) throw new BankError('Введите пароль кошелька');
+            const { login, password } = await readJson(req);
+            if (typeof password !== 'string' || !password) throw new BankError('Введите пароль');
+            if (login && String(login).trim()) {
+                // вход сотрудника: свой логин и пароль, пароль кошелька не нужен
+                let user;
+                try {
+                    user = staff.authenticate(login, password);
+                } catch (e) {
+                    loginFailed(ip);
+                    throw e;
+                }
+                failures.delete(ip);
+                return { token: openSession(null, user), user, shift: staff.shiftInfo() };
+            }
             try {
                 await backend.login(password);
             } catch (e) {
@@ -142,7 +192,7 @@ function createApp(backend, options = {}) {
                 throw e.status === 502 ? e : new BankError('Неверный пароль кошелька', 401);
             }
             failures.delete(ip);
-            return { token: openSession(password) };
+            return { token: openSession(password, staff.owner()), user: staff.owner(), shift: staff.shiftInfo() };
         }, { public: true }],
         ['POST', '/api/bank/webhook', async ({ req }) => {
             const raw = await readRaw(req);
@@ -154,6 +204,29 @@ function createApp(backend, options = {}) {
             return { ok: true };
         }],
         ['GET', '/api/network', () => backend.network()],
+        ['GET', '/api/me', ({ session }) => ({
+            user: session.user, role: ROLES[session.user.role].name, perms: ROLES[session.user.role].perms, shift: staff.shiftInfo(),
+        })],
+
+        // сотрудники, смена, журнал
+        ['GET', '/api/staff', () => ({ staff: staff.list(), roles: Staff.roles() })],
+        ['POST', '/api/staff', async ({ req }) => staff.create(await readJson(req))],
+        ['PATCH', /^\/api\/staff\/([\w-]+)$/, async ({ req, m }) => staff.update(m[1], await readJson(req))],
+        ['DELETE', /^\/api\/staff\/([\w-]+)$/, ({ m }) => staff.remove(m[1])],
+        ['POST', '/api/shift/open', async ({ req, session }) => {
+            const body = await readJson(req);
+            // владелец открывает смену своим паролем; администратор — вводит пароль кошелька
+            const password = session.raw.password || body.password;
+            if (typeof password !== 'string' || !password) throw new BankError('Введите пароль кошелька ноды');
+            try {
+                await backend.login(password);
+            } catch (e) {
+                throw e.status === 502 ? e : new BankError('Неверный пароль кошелька', 401);
+            }
+            return staff.openShift(password, session.user);
+        }],
+        ['POST', '/api/shift/close', () => staff.closeShift()],
+        ['GET', '/api/audit', ({ url }) => staff.auditLog(Number(url.searchParams.get('limit')) || 200)],
 
         // счета и переводы
         ['GET', '/api/accounts', ({ session }) => backend.accounts(session.password)],
@@ -280,7 +353,7 @@ function createApp(backend, options = {}) {
         return {
             'Access-Control-Allow-Origin': origin,
             'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-File-As',
-            'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, OPTIONS',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
             'Access-Control-Expose-Headers': 'Content-Disposition',
             Vary: 'Origin',
         };
@@ -299,16 +372,27 @@ function createApp(backend, options = {}) {
         }
         let status = 200;
         let body;
+        let session = null;
+        const ip = req.socket.remoteAddress || '';
         try {
             const r = route(req.method, url.pathname);
             if (!r) throw new BankError('Метод не найден', 404);
-            const session = r.opts.public ? null : requireSession(req);
-            const ip = req.socket.remoteAddress || '';
+            session = r.opts.public ? null : requireSession(req);
+            if (session) for (const perm of permsFor(req.method, url.pathname)) Staff.require(session.user, perm);
             body = await r.handler({ req, url, m: r.m, session, ip });
         } catch (e) {
             status = e instanceof BankError ? e.status : 500;
             body = { error: e instanceof BankError ? e.message : 'Внутренняя ошибка сервера' };
             if (!(e instanceof BankError)) console.error(e);
+        }
+        // журнал: все действия, кроме просмотра (GET) и запросов без входа, кроме попыток входа
+        if (req.method !== 'GET' && (session || url.pathname === '/api/login')) {
+            const user = session ? session.user : (status === 200 && body && body.user) || { login: (req.bankBody && req.bankBody.login) || 'owner?', role: '—' };
+            try {
+                staff.audit({ user, ip, action: `${req.method} ${url.pathname}`, body: req.bankBody, ok: status < 400, error: status < 400 ? null : body.error });
+            } catch (e) {
+                console.error('audit:', e.message);
+            }
         }
         if (body && body.file && req.headers['x-file-as'] === 'json') {
             // для мобильного приложения: файл в base64 внутри JSON (нативный HTTP не искажает двоичные данные)
@@ -341,6 +425,14 @@ function demoGatewaySettings(backend) {
     };
 }
 
+const DEMO_STAFF = {
+    walletPassword: 'demo12345',
+    users: [
+        { login: 'kassir', name: 'Кассир Анна', role: 'operator', password: 'kassir123' },
+        { login: 'buh', name: 'Бухгалтер Олег', role: 'accountant', password: 'buh12345' },
+    ],
+};
+
 function createServer(backend, options = {}) {
     const handler = createApp(backend, options);
     if (options.tls) return https.createServer(options.tls, handler);
@@ -364,17 +456,18 @@ if (require.main === module) {
             ? new JsonStore(null, { settings: demoGatewaySettings(backend) })
             : new JsonStore(path.join(dataDir, 'gateway.json'), {}),
         webhookSecret: process.env.BANK_WEBHOOK_SECRET || '',
+        demoStaff: demo ? DEMO_STAFF : null,
         sevenpay: demo ? new SevenPayDemo()
             : process.env.SEVENPAY_URL === 'off' ? null : new SevenPayClient(process.env.SEVENPAY_URL || 'https://7pay.in'),
         corsOrigins: (process.env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
     });
     server.listen(port, host, () => {
         console.log(`Банк Erachain: ${tls ? 'https' : 'http'}://${host}:${port}`);
-        console.log(demo ? 'Демо-режим, пароль кошелька: demo12345' : 'RPC ноды: ' + rpc);
+        console.log(demo ? 'Демо-режим: пароль кошелька demo12345; сотрудники kassir/kassir123, buh/buh12345' : 'RPC ноды: ' + rpc);
         if (host !== '127.0.0.1' && host !== 'localhost' && !tls) {
             console.warn('Внимание: сервер доступен из сети без HTTPS — задайте TLS_CERT и TLS_KEY или поставьте его за HTTPS-прокси.');
         }
     });
 }
 
-module.exports = { createApp, createServer, demoGatewaySettings };
+module.exports = { createApp, createServer, demoGatewaySettings, DEMO_STAFF };

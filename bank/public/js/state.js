@@ -7,9 +7,19 @@ export const state = {
     current: null,
     assetNames: new Map([[1, 'ERA'], [2, 'COMPU']]),
     status: null,
+    me: null, // { user, role, perms, shift }
 };
 
 try { state.current = localStorage.getItem('currentAccount'); } catch (e) { /* ignore */ }
+
+export async function loadMe() {
+    state.me = await get('me');
+    return state.me;
+}
+
+export function can(perm) {
+    return !!(state.me && state.me.perms.includes(perm));
+}
 
 export async function loadAccounts() {
     state.accounts = await get('accounts');

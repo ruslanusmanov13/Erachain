@@ -414,3 +414,49 @@ test('7Pay: разбор истории как в Face2Face (массивы unco
     ]);
     assert.strictEqual(list[0].created, '2026-10-01 10:00');
 });
+
+test('сотрудники: роли, смена, отзыв доступа, журнал', async (t) => {
+    const { api, call, accounts } = await startDemo(t);
+    const me = accounts[0].address;
+    const login = async (l, p) => api('POST', '/api/login', { login: l, password: p });
+
+    // владелец заводит сотрудников
+    assert.strictEqual((await call('POST', '/api/staff', { login: 'kassir', name: 'Анна', role: 'operator', password: 'short' })).status, 400);
+    const k = await call('POST', '/api/staff', { login: 'Kassir', name: 'Анна', role: 'operator', password: 'kassir123' });
+    assert.strictEqual(k.data.login, 'kassir');
+    assert.strictEqual((await call('POST', '/api/staff', { login: 'kassir', role: 'viewer', password: 'whatever1' })).data.error, 'Такой логин уже есть');
+    const b = await call('POST', '/api/staff', { login: 'buh', role: 'accountant', password: 'buh12345' });
+    const { data: list } = await call('GET', '/api/staff');
+    assert.ok(!JSON.stringify(list).includes('hash')); // хеши паролей наружу не отдаются
+
+    assert.strictEqual((await login('kassir', 'wrongpass')).status, 401);
+    const kt = (await login('kassir', 'kassir123')).data.token;
+    const bt = (await login('buh', 'buh12345')).data.token;
+
+    // смена закрыта — кассир не видит кошелёк
+    assert.strictEqual((await api('GET', '/api/accounts', null, kt)).status, 423);
+    assert.strictEqual((await api('POST', '/api/shift/open', {}, kt)).status, 403); // открывать смену может только администратор
+    assert.strictEqual((await call('POST', '/api/shift/open', {})).data.open, true);
+
+    // кассир переводит, бухгалтер — нет, но выгружает выписки
+    const tr = await api('POST', '/api/transfer', { from: me, to: B, asset: 1, amount: '1', title: 'Касса' }, kt);
+    assert.strictEqual(tr.status, 200, JSON.stringify(tr.data));
+    assert.strictEqual((await api('POST', '/api/transfer', { from: me, to: B, asset: 1, amount: '1' }, bt)).status, 403);
+    assert.strictEqual((await api('GET', `/api/bank/statement?address=${me}&format=csv`, null, bt)).status, 200);
+    assert.strictEqual((await api('PUT', '/api/bank/settings', { currency: 'USD' }, bt)).status, 403);
+    assert.strictEqual((await api('GET', '/api/staff', null, kt)).status, 403);
+
+    // закрытие смены и отключение сотрудника действуют сразу
+    await call('POST', '/api/shift/close');
+    assert.strictEqual((await api('POST', '/api/transfer', { from: me, to: B, asset: 1, amount: '1' }, kt)).status, 423);
+    await call('PATCH', '/api/staff/' + b.data.id, { disabled: true });
+    assert.strictEqual((await api('GET', '/api/me', null, bt)).status, 401);
+    assert.strictEqual((await login('buh', 'buh12345')).status, 403);
+
+    // журнал: кто что сделал, без паролей
+    const { data: audit } = await call('GET', '/api/audit');
+    const transfer = audit.find((a) => a.action === 'POST /api/transfer' && a.ok);
+    assert.deepStrictEqual([transfer.login, transfer.role, transfer.details.amount, transfer.details.title], ['kassir', 'operator', '1', 'Касса']);
+    assert.ok(audit.some((a) => a.action === 'POST /api/login' && !a.ok && a.login === 'kassir'));
+    assert.ok(!JSON.stringify(audit).includes('kassir123'));
+});

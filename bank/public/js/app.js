@@ -1,7 +1,7 @@
 // Точка входа: маршрутизация по #/раздел, вход в кошелёк, настройка адреса сервера.
 import { get, post, session, setUnauthorizedHandler, needsServer, isNative, serverUrl, setServerUrl } from './api.js';
 import { $, el, card, field, input, form, toast, spinner, confirm } from './ui.js';
-import { state, loadAccounts } from './state.js';
+import { state, loadAccounts, loadMe } from './state.js';
 import home from './views/home.js';
 import transfer from './views/transfer.js';
 import history from './views/history.js';
@@ -17,10 +17,11 @@ import network from './views/network.js';
 import more from './views/more.js';
 import settings from './views/settings.js';
 import swap from './views/swap.js';
+import staffView from './views/staff.js';
 
-const views = { home, transfer, history, assets, polls, exchange, swap, messages, documents, persons, catalog, bank, network, more, settings };
+const views = { home, transfer, history, assets, polls, exchange, swap, staff: staffView, messages, documents, persons, catalog, bank, network, more, settings };
 // разделы, доступные из «Сервисов», подсвечивают эту вкладку
-const navOf = { history: 'home', swap: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
+const navOf = { history: 'home', swap: 'more', staff: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
 
 let renderId = 0;
 
@@ -41,7 +42,13 @@ async function render() {
     $('pageTitle').textContent = v.title;
     view.replaceChildren(spinner());
     try {
-        if (!state.accounts.length) await loadAccounts();
+        if (!state.me) {
+            await loadMe();
+            refreshStatus();
+        }
+        showUser();
+        // без открытой смены сотрудник не видит кошелёк — разделы покажут причину
+        if (!state.accounts.length) await loadAccounts().catch((e) => { if (e.status !== 423) throw e; });
         const node = await v.render(params);
         if (id === renderId) view.replaceChildren(node);
     } catch (e) {
@@ -54,19 +61,22 @@ function showLogin() {
     $('nav').classList.add('hidden');
     $('pageTitle').textContent = 'Банк Erachain';
     const f = form([
-        field('Пароль кошелька ноды', input('password', { type: 'password', autocomplete: 'current-password', required: true })),
+        field('Логин сотрудника', input('login', { autocomplete: 'username', autocapitalize: 'none', placeholder: 'Пусто — вход владельца' }),
+            'Владелец входит без логина, паролем кошелька ноды'),
+        field('Пароль', input('password', { type: 'password', autocomplete: 'current-password', required: true })),
     ], 'Войти', async (data, formEl) => {
-        const { token } = await post('login', { password: data.password });
+        const { token } = await post('login', { login: data.login.trim() || undefined, password: data.password });
         formEl.reset();
         session.setToken(token);
         state.accounts = [];
+        state.me = null;
         if (!location.hash || location.hash === '#/') location.hash = '#/home';
         else render();
     });
     $('view').replaceChildren(el('div', { class: 'login-wrap' },
         card(
             el('h2', {}, 'Вход'),
-            el('p', { class: 'muted small' }, 'Ключи хранятся в кошельке вашей ноды Erachain. Пароль передаётся только серверу банка и не сохраняется на устройстве.'),
+            el('p', { class: 'muted small' }, 'Ключи хранятся в кошельке ноды Erachain. Пароль передаётся только серверу банка и не сохраняется на устройстве.'),
             f,
         ),
         isNative() ? el('p', { class: 'center small muted' }, 'Сервер: ' + serverUrl() + ' · ', el('a', { href: '#', onclick: (e) => { e.preventDefault(); setServerUrl(null); render(); } }, 'изменить')) : null,
@@ -97,12 +107,21 @@ function showServerSetup() {
     $('view').replaceChildren(el('div', { class: 'login-wrap' }, card(el('h2', {}, 'Сервер банка'), f)));
 }
 
+function showUser() {
+    const me = state.me;
+    if (!me) return;
+    const shift = me.user.role === 'owner' ? '' : me.shift.open ? ' · смена открыта' : ' · смена закрыта';
+    $('status').dataset.user = `${me.user.name} (${me.role.toLowerCase()})${shift}`;
+    $('status').title = $('status').dataset.user;
+}
+
 async function refreshStatus() {
     if (needsServer()) return;
     try {
         const s = await get('status');
         state.status = s;
-        $('status').textContent = (s.mode === 'demo' ? 'демо · ' : '') + 'блок ' + Number(s.height).toLocaleString('ru-RU');
+        $('status').textContent = (s.mode === 'demo' ? 'демо · ' : '') + 'блок ' + Number(s.height).toLocaleString('ru-RU')
+            + (state.me ? ' · ' + state.me.user.name : '');
     } catch (e) {
         $('status').textContent = 'нет связи';
     }
@@ -110,6 +129,7 @@ async function refreshStatus() {
 
 setUnauthorizedHandler(() => {
     state.accounts = [];
+    state.me = null;
     showLogin();
 });
 
@@ -118,6 +138,7 @@ window.addEventListener('bank:logout', async () => {
     try { await post('logout'); } catch (e) { /* ignore */ }
     session.setToken(null);
     state.accounts = [];
+    state.me = null;
     render();
 });
 

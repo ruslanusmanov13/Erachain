@@ -1,4 +1,5 @@
 import { el } from '../ui.js';
+import { can } from '../state.js';
 
 const ITEMS = [
     ['#/history', 'История', 'Все операции по счетам', 'M4 6h16M4 12h16M4 18h10'],
@@ -13,6 +14,7 @@ const ITEMS = [
     ['#/catalog', 'Справочники', 'Статусы и шаблоны', 'M4 4h12a4 4 0 0 1 4 4v12H8a4 4 0 0 1-4-4z'],
     ['#/bank/gateway', 'Банковский шлюз', 'Ввод и вывод денег', 'M3 10h18L12 4zM5 10v8M19 10v8M3 20h18'],
     ['#/network', 'Сеть', 'Состояние ноды', 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18'],
+    ['#/staff', 'Сотрудники', 'Роли, смена, журнал действий', 'M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM2 21a7 7 0 0 1 14 0M17 11a3 3 0 1 0 0-6M22 21a6 6 0 0 0-5-6', 'staff'],
     ['#/settings', 'Настройки', 'Сервер, выход', 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19 12l2-1-2-4-2 1-2-2V4h-4v2L9 7 7 6 5 10l2 1v2l-2 1 2 4 2-1 2 2v2h4v-2l2-2 2 1 2-4-2-1z'],
 ];
 
@@ -33,7 +35,7 @@ function icon(d) {
 export default {
     title: 'Сервисы',
     async render() {
-        return el('div', { class: 'menu-grid' }, ITEMS.map(([href, title, sub, d]) => el('a', { class: 'menu-tile', href },
+        return el('div', { class: 'menu-grid' }, ITEMS.filter((i) => !i[4] || can(i[4])).map(([href, title, sub, d]) => el('a', { class: 'menu-tile', href },
             icon(d), el('b', {}, title), el('span', { class: 'muted' }, sub))));
     },
 };

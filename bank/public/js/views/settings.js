@@ -17,6 +17,10 @@ export default {
             });
         }
         return el('div', { class: 'stack' },
+            state.me ? card(el('h2', {}, 'Вы вошли'), kv([
+                ['Сотрудник', state.me.user.name], ['Логин', state.me.user.login], ['Роль', state.me.role],
+                ['Смена', state.me.user.role === 'owner' ? null : (state.me.shift.open ? 'открыта' : 'закрыта')],
+            ]), state.me.perms.includes('staff') ? el('a', { class: 'btn block soft', href: '#/staff' }, 'Сотрудники, смена, журнал') : null) : null,
             card(el('h2', {}, 'Подключение'), kv([
                 ['Сервер банка', isNative() ? serverUrl() : location.origin],
                 ['Режим', s.mode === 'demo' ? 'демо' : 'нода Erachain'],
