@@ -1,5 +1,5 @@
 import { get, post } from '../api.js';
-import { el, card, field, input, tabs, fmt, short, date, kv, empty, spinner, toast, copy, badge, confirm, openDialog, closeDialog } from '../ui.js';
+import { el, card, field, input, form, tabs, fmt, short, date, kv, empty, spinner, toast, copy, badge, confirm, openDialog, closeDialog, qrCode } from '../ui.js';
 import { state, loadAccounts, accountSelect, balanceOf } from '../state.js';
 
 const STATUS = {
@@ -54,8 +54,11 @@ function paymentDialog(order, onPaid) {
         parts.push(field('Оплатить со счёта', from), pay, err,
             el('p', { class: 'tiny muted' }, `Перевод уйдёт на счёт обменника ${short(order.addr_in)} с заголовком «${order.addr_out_full}» — по нему 7Pay определит, куда выплатить ${order.out}.`));
     } else if (order.status === 'awaiting_payment') {
+        const qrBox = el('div', {});
+        qrCode(order.uri || order.addr_in).then((svg) => qrBox.replaceChildren(svg)).catch(() => {});
         parts.push(
-            el('p', { class: 'small' }, `Отправьте ровно ${fmt(order.volume_in)} ${order.in} на адрес обменника:`),
+            el('p', { class: 'small' }, `Отправьте ровно ${fmt(order.volume_in)} ${order.in} на адрес обменника — или отсканируйте QR-код кошельком:`),
+            qrBox,
             el('p', { class: 'mono' }, order.addr_in),
             el('div', { class: 'row wrap' },
                 el('button', { class: 'btn', type: 'button', onclick: () => copy(order.addr_in, 'Адрес скопирован') }, 'Копировать адрес'),
@@ -69,17 +72,30 @@ function paymentDialog(order, onPaid) {
     openDialog(...parts);
 }
 
+const STAGE = {
+    unconfirmed: ['ждёт подтверждений', 'warn'], in_process: ['получен, обрабатывается', 'warn'],
+    paying_out: ['выплата отправляется', 'warn'], paid_out: ['выплачено', 'ok'],
+};
+
+function paymentsList(payments) {
+    if (!payments.length) return empty('Платежей пока нет');
+    return el('div', { class: 'list' }, payments.map((p) => {
+        const [label, kind] = STAGE[p.stage] || [p.stage, ''];
+        return el('div', { class: 'list-item' }, el('div', { class: 'grow stack' },
+            el('div', { class: 'row between' },
+                el('b', { class: 'num' }, `${fmt(p.amountIn)} ${p.currIn || ''}`, p.amountOut !== null ? ` → ${fmt(p.amountOut)} ${p.currOut}` : ''),
+                badge(label, kind)),
+            el('div', { class: 'tiny muted' }, [p.created ? String(p.created).slice(0, 16) : '', p.note, p.fee ? `комиссия ${fmt(p.fee)} ${p.currOut}` : ''].filter(Boolean).join(' · ')),
+            p.txidIn ? el('div', { class: 'tiny mono muted' }, 'вход: ' + p.txidIn) : null,
+            p.txidOut ? el('div', { class: 'tiny mono muted' }, 'выплата: ' + p.txidOut) : null));
+    }));
+}
+
 async function statusDialog(order) {
     openDialog(el('h3', {}, 'Статус в 7Pay'), spinner());
     try {
         const h = await get(`swap/orders/${order.id}/history`);
-        const block = (title, list) => (list.length ? [el('b', {}, title), el('div', { class: 'list' }, list.map((p) => el('div', { class: 'list-item' },
-            el('div', { class: 'grow' },
-                el('div', { class: 'title' }, `${fmt(p.amountIn)} ${p.currIn || order.in}`),
-                el('div', { class: 'sub' }, [p.created ? date(Date.parse(p.created)) : '', p.statusMessage || p.status || '', p.confirmations !== null ? `подтверждений: ${p.confirmations}` : ''].filter(Boolean).join(' · ')),
-                p.txid ? el('div', { class: 'tiny mono muted' }, p.txid) : null))))] : []);
-        const all = [...block('Ждут подтверждения', h.unconfirmed), ...block('В обработке', h.inProcess), ...block('Выплачено', h.done)];
-        openDialog(el('h3', {}, 'Статус в 7Pay'), ...(all.length ? all : [empty('Платежей по заявке пока нет')]),
+        openDialog(el('h3', {}, 'Статус в 7Pay'), paymentsList(h.payments),
             el('div', { class: 'row end' }, el('button', { class: 'btn', type: 'button', onclick: () => paymentDialog(order, () => {}) }, 'Назад'),
                 el('button', { class: 'btn primary', type: 'button', onclick: closeDialog }, 'Закрыть')));
     } catch (e) {
@@ -118,6 +134,7 @@ async function exchangeForm() {
         const my = ++seq;
         err.textContent = '';
         const amount = (side === 'in' ? amountIn.value : amountOut.value).trim().replace(',', '.');
+        submit.disabled = false;
         if (!(Number(amount) > 0) || fromSel.value === toSel.value) {
             quoteBox.textContent = fromSel.value === toSel.value ? 'Выберите разные валюты' : '';
             lastQuote = null;
@@ -135,7 +152,8 @@ async function exchangeForm() {
             if (q.mayPay !== null) lines.push(`Принимает до: ${fmt(q.mayPay)} ${q.from}`);
             if (q.minIn) lines.push(`Минимум: ${fmt(q.minIn)} ${q.from}`);
             if (q.payFromWallet) lines.push(`${q.from} — актив Erachain: оплатите прямо со счёта (доступно ${fmt(balanceOf(state.accounts.find((a) => a.address === state.current), inInfo().asset))})`);
-            quoteBox.replaceChildren(...lines.map((l) => el('div', {}, l)));
+            quoteBox.replaceChildren(...lines.map((l) => el('div', {}, l)), ...q.problems.map((l) => el('p', { class: 'note' }, l)));
+            submit.disabled = q.problems.length > 0;
         } catch (e) {
             if (my !== seq) return;
             lastQuote = null;
@@ -216,11 +234,41 @@ async function ordersList() {
     })));
 }
 
+async function ratesView() {
+    const r = await get('swap/rates');
+    const bases = Object.entries(r).filter(([, list]) => list.length);
+    if (!bases.length) return card(empty('Обменник не сообщил курсы'));
+    const abbrevs = [...new Set(bases.flatMap(([, list]) => list.map((x) => x.abbrev)))];
+    const price = (base, abbrev) => {
+        const x = r[base].find((i) => i.abbrev === abbrev);
+        return x ? fmt(x.rate, x.rate < 1 ? 8 : 2) : '—';
+    };
+    return card(
+        el('p', { class: 'small muted' }, 'Средние курсы обменника 7Pay: сколько стоит 1 единица валюты.'),
+        el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
+            el('tr', {}, el('th', {}, 'Валюта'), ...bases.map(([b]) => el('th', { class: 'right' }, 'в ' + b))),
+            abbrevs.map((a) => el('tr', {}, el('td', {}, el('b', {}, a)), ...bases.map(([b]) => el('td', { class: 'right num' }, price(b, a))))))));
+}
+
+function trackView() {
+    const result = el('div', {});
+    return el('div', { class: 'stack' }, card(form([
+        el('p', { class: 'small muted' }, 'Найдите платежи по адресу получения — даже если заявка создана на сайте обменника или в другом кошельке.'),
+        el('div', { class: 'grid-2' },
+            field('Валюта получения', input('curr', { placeholder: 'ERA', value: 'ERA' })),
+            field('Адрес получения', input('address', { required: true, spellcheck: 'false', value: state.current || '' }))),
+    ], 'Найти платежи', async (d) => {
+        result.replaceChildren(spinner());
+        const r = await get(`swap/track?curr=${encodeURIComponent(d.curr.trim())}&address=${encodeURIComponent(d.address.trim())}`);
+        result.replaceChildren(card(paymentsList(r.payments)));
+    })), result);
+}
+
 export default {
     title: 'Обмен 7Pay',
     async render(params) {
-        const views = { exchange: exchangeForm, orders: ordersList };
-        const mode = params[0] === 'orders' ? 'orders' : 'exchange';
+        const views = { exchange: exchangeForm, orders: ordersList, rates: ratesView, track: trackView };
+        const mode = views[params[0]] ? params[0] : 'exchange';
         const body = el('div', {}, spinner());
         const show = async (k) => {
             body.replaceChildren(spinner());
@@ -231,6 +279,6 @@ export default {
             }
         };
         show(mode);
-        return el('div', {}, tabs([['exchange', 'Обмен'], ['orders', 'Мои заявки']], mode, show), body);
+        return el('div', {}, tabs([['exchange', 'Обмен'], ['orders', 'Мои заявки'], ['rates', 'Курсы'], ['track', 'Отследить']], mode, show), body);
     },
 };

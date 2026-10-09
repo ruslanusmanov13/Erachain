@@ -218,6 +218,8 @@ function createApp(backend, options = {}) {
         ['POST', '/api/swap/orders', async ({ req }) => requireSwap().createOrder(await readJson(req))],
         ['POST', /^\/api\/swap\/orders\/([\w-]+)\/pay$/, async ({ req, m, session }) => requireSwap().pay(m[1], await readJson(req), session.password)],
         ['GET', /^\/api\/swap\/orders\/([\w-]+)\/history$/, ({ m }) => requireSwap().history(m[1])],
+        ['GET', '/api/swap/rates', () => requireSwap().rates()],
+        ['GET', '/api/swap/track', ({ url }) => requireSwap().track(url.searchParams.get('curr'), url.searchParams.get('address'))],
 
         // банковская интеграция
         ['GET', '/api/bank/statement', ({ url, session }) => statement(url, session)],

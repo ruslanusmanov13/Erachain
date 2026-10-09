@@ -229,3 +229,30 @@ export async function photoToBase64(file) {
         URL.revokeObjectURL(url);
     }
 }
+
+// QR-код (SVG) для адреса или платёжной ссылки — можно отсканировать другим кошельком
+export async function qrCode(text, size = 220) {
+    const { default: qrcode } = await import('./vendor/qrcode.js');
+    const qr = qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount();
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', `-2 -2 ${n + 4} ${n + 4}`);
+    svg.setAttribute('width', String(size));
+    svg.setAttribute('height', String(size));
+    svg.setAttribute('class', 'qr');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', 'QR-код: ' + text);
+    let d = '';
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) d += `M${c} ${r}h1v1h-1z`;
+    const bg = document.createElementNS(ns, 'rect');
+    bg.setAttribute('x', '-2'); bg.setAttribute('y', '-2'); bg.setAttribute('width', String(n + 4)); bg.setAttribute('height', String(n + 4));
+    bg.setAttribute('fill', '#ffffff');
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('fill', '#000000');
+    svg.append(bg, path);
+    return svg;
+}

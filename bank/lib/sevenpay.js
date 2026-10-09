@@ -72,6 +72,21 @@ class SevenPayClient {
     history(currOut, address) {
         return this.call(`history.json/${currOut}/${encodeURIComponent(address)}`);
     }
+
+    // сводные курсы обменника: {btc|usd|rub: [[цена, 'LTC'], ...]} — цена 1 единицы валюты
+    async ratesTable() {
+        if (this.ratesCache && this.ratesCache.expires > Date.now()) return this.ratesCache.data;
+        let res;
+        try {
+            res = await fetch(this.baseUrl + '/api/rates3.json', { signal: AbortSignal.timeout(this.timeoutMs) });
+        } catch (e) {
+            throw new BankError('Обменник 7Pay недоступен: ' + this.baseUrl, 502);
+        }
+        const data = await res.json().catch(() => null);
+        if (!data || typeof data !== 'object' || data.error) throw new BankError('7Pay: курсы недоступны');
+        this.ratesCache = { data, expires: Date.now() + 60000 };
+        return data;
+    }
 }
 
 /**
@@ -157,13 +172,23 @@ class SevenPayDemo {
     }
 
     async history(currOut, address) {
-        const done = this.payments
-            .filter((p) => p.currOut === currOut && p.address === address)
-            .map((p) => ({
-                curr_in: { abbrev: p.curr_in }, curr_out: { abbrev: p.currOut }, acc: p.address,
-                amount_in: p.amount_in, txid: p.txid, created: p.created, stasus: 'ok', status_mess: `выплачено ${p.amount_out} ${p.currOut}`,
-            }));
+        const mine = this.payments.filter((p) => p.currOut === currOut && p.address === address);
+        if (!mine.length) throw new BankError('7Pay: Deal ACCOUNT not found. Use ABBREV/ACCOUNT');
+        const done = mine.map((p) => ({
+            curr_in: { abbrev: p.curr_in }, curr_out: { abbrev: p.currOut }, acc: p.address,
+            amount_in: p.amount_in, txid: p.txid, created: p.created, stasus: 'ok', status_mess: String(p.amount_out),
+            pay_out: {
+                amount: p.amount_out, amo_taken: Number((p.amount_out * this.fee).toFixed(8)), amo_gift: 0, amo_partner: 0,
+                amo_to_pay: p.amount_out, txid: crypto.randomBytes(32).toString('hex'), status: 'success', vars: { status: 'success' },
+            },
+        }));
         return { unconfirmed: [], in_process: [], done };
+    }
+
+    async ratesTable() {
+        const line = (base) => Object.keys(this.prices).filter((k) => k !== 'ETH').map((k) => [Number((this.prices[k] / base).toPrecision(6)), k]);
+        // 1 BTC ≈ 61 000 USD ≈ 5 600 000 RUB (демо)
+        return { btc: line(1), usd: line(1 / 61000), rub: line(1 / 5600000) };
     }
 }
 
@@ -207,11 +232,13 @@ class SwapService {
         const { from, to, amount, side, cin, cout } = await this.check(body);
         const r = await this.client.rate(from, to, amount, side);
         if (r.wrong) throw new BankError('7Pay: курс не найден — ' + r.wrong);
-        return {
+        const q = {
             from, to, side, volumeIn: r.volume_in, volumeOut: r.volume_out, rate: r.rate, baseRate: r.base_rate ?? null,
-            available: r.bal ?? null, mayPay: r.may_pay ?? null, minIn: cin.min, minOut: cout.min,
+            available: r.bal ?? null, mayPay: r.may_pay ?? cin.mayPay ?? null, minIn: cin.min, minOut: cout.min,
             payFromWallet: cin.erachain, receiveToWallet: cout.erachain,
         };
+        q.problems = limitProblems(q);
+        return q;
     }
 
     async createOrder(body) {
@@ -220,6 +247,8 @@ class SwapService {
         if (cout.erachain ? !isAddress(address) : !COIN_ADDRESS_RE.test(address)) {
             throw new BankError(`Неверный адрес ${to} для получения`);
         }
+        const problems = limitProblems(await this.quote(body));
+        if (problems.length) throw new BankError(problems[0]);
         const r = await this.client.order(from, to, address, amount, side);
         if (r.wrong) throw new BankError('7Pay: ' + (r.wrong === 'rate not found' ? 'курс не найден, попробуйте позже' : r.wrong));
         const order = {
@@ -267,29 +296,84 @@ class SwapService {
         return order;
     }
 
+    // платежи по адресу получения: можно отследить и заявку, созданную не в этом приложении
+    async track(currOut, address) {
+        currOut = text(currOut, 10).toUpperCase();
+        address = text(address, 80);
+        if (!/^[A-Z0-9]{2,10}$/.test(currOut) || !/^[0-9A-Za-z]{25,62}$/.test(address)) {
+            throw new BankError('Укажите валюту получения и адрес, например ERA:7Az8…');
+        }
+        let h;
+        try {
+            h = await this.client.history(currOut, address);
+        } catch (e) {
+            // 7Pay отвечает ошибкой, пока по адресу не было ни одного платежа
+            if (/not found/i.test(e.message)) return { payments: [] };
+            throw e;
+        }
+        return { payments: parseHistory(h, currOut) };
+    }
+
     async history(id) {
         const order = this.store.data.swaps.find((o) => o.id === id);
         if (!order) throw new BankError('Заявка не найдена', 404);
-        let h;
-        try {
-            h = await this.client.history(order.out, order.addr_out);
-        } catch (e) {
-            // 7Pay отвечает ошибкой, пока по заявке не было ни одного платежа
-            if (/not found/i.test(e.message)) return { unconfirmed: [], inProcess: [], done: [] };
-            throw e;
-        }
-        const map = (list) => (Array.isArray(list) ? list : []).map((p) => ({
-            currIn: p.curr_in && p.curr_in.abbrev, amountIn: p.amount_in ?? null, txid: p.txid || null,
-            created: p.created || null, status: p.stasus || p.status || null, statusMessage: p.status_mess || null,
-            confirmations: p.confs ?? p.confirmations ?? null,
-        }));
-        const result = { unconfirmed: map(h.unconfirmed), inProcess: map(h.in_process), done: map(h.done) };
-        if (result.done.length && order.status !== 'done') {
+        const result = await this.track(order.out, order.addr_out);
+        if (result.payments.some((p) => p.stage === 'paid_out') && order.status !== 'done') {
             order.status = 'done';
             this.store.save();
         }
         return result;
     }
+
+    async rates() {
+        const t = await this.client.ratesTable();
+        const conv = (list) => (Array.isArray(list) ? list : []).map(([rate, abbrev]) => ({ abbrev, rate: Number(rate) }));
+        return { BTC: conv(t.btc), USD: conv(t.usd), RUB: conv(t.rub) };
+    }
 }
 
-module.exports = { SevenPayClient, SevenPayDemo, SwapService, isErachainToken, DEAL_TO_COIN };
+// Проверка лимитов обменника (как в Face2Face): минимум, остаток обменника, сколько он готов принять
+function limitProblems(q) {
+    const p = [];
+    if (q.minIn && q.volumeIn < q.minIn) p.push(`Слишком мало: минимум ${q.minIn} ${q.from}`);
+    if (q.minOut && q.volumeOut < q.minOut) p.push(`Слишком мало к получению: минимум ${q.minOut} ${q.to}`);
+    if (q.available !== null && q.volumeOut > q.available) p.push(`В обменнике сейчас только ${q.available} ${q.to}`);
+    if (q.mayPay !== null && q.volumeIn > q.mayPay) p.push(`Обменник примет не больше ${q.mayPay} ${q.from}`);
+    return p;
+}
+
+// История 7Pay: unconfirmed — массивы [валюта, сумма, txid, …, дата], in_process и done — объекты,
+// в done есть pay_out — исходящая выплата (формат как в клиенте Face2Face)
+function parseHistory(h, currOut) {
+    const out = [];
+    for (const row of Array.isArray(h.unconfirmed) ? h.unconfirmed : []) {
+        const arr = Array.isArray(row) ? row : [];
+        out.push({
+            stage: 'unconfirmed', currIn: (arr[0] && arr[0].abbrev) || null, amountIn: arr[1] ?? null, txidIn: arr[2] || null,
+            created: arr[6] || null, currOut, amountOut: null, txidOut: null, fee: null, note: 'ждёт подтверждений в сети',
+        });
+    }
+    const status = (row) => (row.stasus === 'ok' || row.stasus === 'added' ? 'получен' : row.stasus || '');
+    for (const row of Array.isArray(h.in_process) ? h.in_process : []) {
+        out.push({
+            stage: 'in_process', currIn: row.curr_in && row.curr_in.abbrev, amountIn: row.amount_in ?? null, txidIn: row.txid || null,
+            created: row.created || null, currOut, amountOut: null, txidOut: null, fee: null,
+            note: [status(row), row.status_mess].filter(Boolean).join(': ') || 'обрабатывается',
+        });
+    }
+    for (const row of Array.isArray(h.done) ? h.done : []) {
+        const po = row.pay_out;
+        const paid = po ? (po.vars && po.vars.status === 'success') || po.status === 'success' : false;
+        out.push({
+            stage: paid || !po ? 'paid_out' : 'paying_out',
+            currIn: row.curr_in && row.curr_in.abbrev, amountIn: row.amount_in ?? null, txidIn: row.txid || null,
+            created: row.created || null, currOut: (row.curr_out && row.curr_out.abbrev) || currOut,
+            amountOut: po ? po.amount : Number.parseFloat(row.status_mess) || null, txidOut: po ? po.txid || null : null,
+            fee: po && po.amo_taken ? po.amo_taken : null,
+            note: po ? (paid ? 'выплачено' : 'выплата отправляется') : (row.status_mess || 'выплачено'),
+        });
+    }
+    return out;
+}
+
+module.exports = { SevenPayClient, SevenPayDemo, SwapService, isErachainToken, parseHistory, limitProblems, DEAL_TO_COIN };

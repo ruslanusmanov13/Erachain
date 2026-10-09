@@ -350,7 +350,17 @@ test('7Pay (демо): курс, заявка BTC → ERA, оплата ERA с �
     assert.strictEqual((await call('POST', `/api/swap/orders/${eraOrder.data.id}/pay`, { from: me })).status, 400); // второй раз нельзя
 
     const hist = await call('GET', `/api/swap/orders/${eraOrder.data.id}/history`);
-    assert.strictEqual(hist.data.done.length, 1);
+    assert.deepStrictEqual(hist.data.payments.map((p) => [p.stage, p.currIn, p.amountIn]), [['paid_out', 'ERA', 100]]);
+    const tracked = await call('GET', `/api/swap/track?curr=BTC&address=${btcAddr}`);
+    assert.strictEqual(tracked.data.payments[0].amountOut, eraOrder.data.volume_out);
+
+    // лимиты: обменник не выдаст больше, чем у него есть
+    const big = await call('POST', '/api/swap/quote', { from: 'ERA', to: 'BTC', amount: '100000000' });
+    assert.match(big.data.problems.join(), /только/);
+    assert.match((await call('POST', '/api/swap/orders', { from: 'ERA', to: 'BTC', amount: '100000000', address: btcAddr })).data.error, /только/);
+
+    const rates = await call('GET', '/api/swap/rates');
+    assert.ok(rates.data.RUB.find((r) => r.abbrev === 'ERA').rate > 0);
     const { data: orders } = await call('GET', '/api/swap/orders');
     assert.deepStrictEqual(orders.map((o) => o.status), ['done', 'awaiting_payment']);
 });
@@ -362,6 +372,7 @@ test('7Pay: клиент вызывает apipay и разбирает ошиб�
         const reply = (b) => res.end(JSON.stringify(b));
         if (req.url.startsWith('/apipay/get_currs.json')) return reply({ in: { BTC: { id: 3, name: 'Bitcoin', min: 0.0001 }, ERA: { id: 9, name: 'ERA', system: 'erachain', token_key: 1 } }, out: { ERA: { id: 9, name: 'ERA', system: 'erachain', token_key: 1, bal: 1000 }, BTC: { id: 3, name: 'Bitcoin', bal: 0.5 } } });
         if (req.url.startsWith('/apipay/get_rate.json/BTC/ERA/0.01')) return reply({ volume_in: 0.01, volume_out: 1900, rate: 190000, bal: 1000 });
+        if (req.url.startsWith('/apipay/get_rate.json/ERA/BTC/100')) return reply({ volume_in: 100, volume_out: 0.0005, rate: 0.000005, bal: 0.5 });
         if (req.url.startsWith('/apipay/get_uri_in.json/2/ERA/BTC/')) return reply({ volume_in: 100, volume_out: 0.0005, rate: 0.000005, addr_in: B, uri: 'erachain:' + B, addr_out_full: 'BTC:1BoatSLRHtKNngkdXEeobR76b53LETtpyT' });
         if (req.url.startsWith('/apipay/history.json/BTC/')) return reply({ error: 'Deal ACCOUNT not found. Use ABBREV/ACCOUNT' });
         res.statusCode = 404;
@@ -380,7 +391,26 @@ test('7Pay: клиент вызывает apipay и разбирает ошиб�
     const order = await swap.createOrder({ from: 'ERA', to: 'BTC', amount: '100', address: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT' });
     assert.deepStrictEqual([order.payAsset, order.addr_in, order.addr_out_full], [1, B, 'BTC:1BoatSLRHtKNngkdXEeobR76b53LETtpyT']);
     assert.ok(seen.includes('/apipay/get_uri_in.json/2/ERA/BTC/1BoatSLRHtKNngkdXEeobR76b53LETtpyT/100'));
-    assert.deepStrictEqual(await swap.history(order.id), { unconfirmed: [], inProcess: [], done: [] }); // ещё нет платежей
+    assert.deepStrictEqual(await swap.history(order.id), { payments: [] }); // ещё нет платежей
     await assert.rejects(swap.quote({ from: 'DOGE', to: 'ERA', amount: '1' }), /не принимает DOGE/);
     await assert.rejects(swap.quote({ from: 'BTC', to: 'ERA', amount: '0.02' }), /7Pay: not found/);
+});
+
+test('7Pay: разбор истории как в Face2Face (массивы unconfirmed, pay_out)', () => {
+    const { parseHistory } = require('../lib/sevenpay');
+    const list = parseHistory({
+        unconfirmed: [[{ abbrev: 'BTC' }, 0.01, 'tx-in-1', 0, 0, 0, '2026-10-01 10:00']],
+        in_process: [{ curr_in: { abbrev: 'BTC' }, amount_in: 0.02, txid: 'tx-in-2', stasus: 'ok', status_mess: 'в очереди' }],
+        done: [
+            { curr_in: { abbrev: 'BTC' }, curr_out: { abbrev: 'ERA' }, amount_in: 0.03, txid: 'tx-in-3', stasus: 'ok',
+              pay_out: { amount: 5500, amo_taken: 27, txid: 'tx-out-3', vars: { status: 'success' } } },
+            { curr_in: { abbrev: 'BTC' }, curr_out: { abbrev: 'ERA' }, amount_in: 0.04, txid: 'tx-in-4', stasus: 'ok',
+              pay_out: { amount: 7300, txid: null, vars: { status: 'pending' } } },
+        ],
+    }, 'ERA');
+    assert.deepStrictEqual(list.map((p) => [p.stage, p.amountIn, p.amountOut, p.txidOut]), [
+        ['unconfirmed', 0.01, null, null], ['in_process', 0.02, null, null],
+        ['paid_out', 0.03, 5500, 'tx-out-3'], ['paying_out', 0.04, 7300, null],
+    ]);
+    assert.strictEqual(list[0].created, '2026-10-01 10:00');
 });

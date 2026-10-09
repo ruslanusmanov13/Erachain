@@ -1,5 +1,5 @@
 import { get, post } from '../api.js';
-import { el, card, fmt, short, toast, copy, share, openDialog, closeDialog, sectionTitle, empty } from '../ui.js';
+import { el, card, fmt, short, toast, copy, share, openDialog, closeDialog, sectionTitle, empty, qrCode } from '../ui.js';
 import { state, loadAccounts, setCurrent, currentAccount, balanceOf } from '../state.js';
 import { txItem } from './common.js';
 
@@ -16,9 +16,12 @@ const icon = (d) => {
 };
 
 function receiveDialog(address) {
+    const qrBox = el('div', {});
+    qrCode(address).then((svg) => qrBox.replaceChildren(svg)).catch(() => {});
     openDialog(
         el('h3', {}, 'Получить перевод'),
-        el('p', { class: 'muted small' }, 'Сообщите отправителю адрес этого счёта в сети Erachain:'),
+        el('p', { class: 'muted small' }, 'Покажите QR-код или сообщите отправителю адрес этого счёта в сети Erachain:'),
+        qrBox,
         el('p', { class: 'mono' }, address),
         el('div', { class: 'row end wrap' },
             el('button', { class: 'btn', onclick: () => copy(address, 'Адрес скопирован') }, 'Копировать'),
@@ -39,10 +42,24 @@ export default {
             totalEra += Number(balanceOf(a, 1));
             totalCompu += Number(balanceOf(a, 2));
         }
+        const valuation = el('div', { class: 'muted small num' });
         root.append(el('section', { class: 'card hero stack' },
             el('div', { class: 'muted small' }, `Всего на ${accounts.length} ${accounts.length === 1 ? 'счёте' : 'счетах'}`),
             el('div', { class: 'big num' }, fmt(totalEra, 4) + ' ERA'),
-            el('div', { class: 'muted small num' }, fmt(totalCompu, 6) + ' COMPU на комиссии')));
+            el('div', { class: 'muted small num' }, fmt(totalCompu, 6) + ' COMPU на комиссии'),
+            valuation));
+        // оценка ERA и COMPU по курсам обменника 7Pay (если он подключён)
+        get('swap/rates').then((r) => {
+            const value = (base) => {
+                const p = (a) => ((r[base] || []).find((x) => x.abbrev === a) || {}).rate;
+                return p('ERA') ? totalEra * p('ERA') + (p('COMPU') ? totalCompu * p('COMPU') : 0) : null;
+            };
+            const rub = value('RUB');
+            const usd = value('USD');
+            if (rub !== null || usd !== null) {
+                valuation.textContent = '≈ ' + [rub !== null ? fmt(rub, 0) + ' ₽' : '', usd !== null ? fmt(usd, 2) + ' $' : ''].filter(Boolean).join(' · ') + ' по курсу 7Pay';
+            }
+        }).catch(() => {});
 
         const strip = el('div', { class: 'accounts-strip' });
         for (const a of accounts) {
