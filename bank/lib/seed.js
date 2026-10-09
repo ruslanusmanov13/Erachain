@@ -59,7 +59,7 @@ function seedBytes(seed) {
     if (!bytes) throw new BankError('В сид-фразе есть недопустимые символы (Base58: без 0, O, I и l)');
     // Erachain дополняет короткие сиды нулями слева — так же, как нода
     if (bytes.length > SEED_BYTES) throw new BankError('Сид-фраза слишком длинная — проверьте, не склеились ли две');
-    if (bytes.length < SEED_BYTES - 2) throw new BankError('Сид-фраза слишком короткая — проверьте, все ли группы введены');
+    if (bytes.length < SEED_BYTES - 2) throw new BankError('Сид-фраза слишком короткая — проверьте, что она введена полностью (44 символа)');
     return Buffer.concat([Buffer.alloc(SEED_BYTES - bytes.length), bytes]);
 }
 
@@ -111,6 +111,43 @@ function open(key, box) {
     return out.toString('utf8');
 }
 
+// «Личность» по сид-фразе: пароль кошелька, зашифрованный ключом из фразы и отдельно — ключом каждого
+// из 21 счёта (для входа в кабинет одного счёта по его приватному ключу). Ни фраза, ни ключи не хранятся.
+const scryptKey = (bytes, salt) => crypto.scryptSync(bytes, Buffer.from(salt, 'hex'), 32);
+
+function sealIdentity(seed, walletPassword) {
+    const { deriveAccounts } = require('./erakeys');
+    const salt = crypto.randomBytes(16).toString('hex');
+    const norm = normalizeSeed(seed);
+    const accounts = deriveAccounts(norm).map((a) => {
+        const s = crypto.randomBytes(16).toString('hex');
+        return { n: a.n, address: a.address, salt: s, ...seal(scryptKey(base58Decode(a.privateKey), s), walletPassword) };
+    });
+    return {
+        salt, ...seal(scryptKey(seedBytes(norm), salt), walletPassword), boundAt: Date.now(),
+        hint: norm.slice(0, 4) + '…' + norm.slice(-4), // чтобы узнать, какая фраза привязана
+        accounts,
+    };
+}
+
+// пароль кошелька по сид-фразе или null
+function openBySeed(identity, seed) {
+    return open(scryptKey(seedBytes(seed), identity.salt), identity);
+}
+
+// по приватному ключу счёта: { account: { n, address }, walletPassword } или null
+function openByKey(identity, acc) {
+    const box = (identity.accounts || []).find((a) => a.address === acc.address);
+    if (!box) return null;
+    const walletPassword = open(scryptKey(base58Decode(acc.privateKey), box.salt), box);
+    return walletPassword ? { account: { n: box.n, address: box.address }, walletPassword } : null;
+}
+
+// первый счёт фразы — по нему фраза узнаётся без перебора
+function firstAddress(seed) {
+    return require('./erakeys').deriveAccounts(seed, 1)[0].address;
+}
+
 class OwnerKey {
     constructor(store) {
         this.store = store;
@@ -120,36 +157,19 @@ class OwnerKey {
         return !!this.store.data.ownerKey;
     }
 
+    identity() {
+        return this.store.data.ownerKey || null;
+    }
+
     info() {
         const k = this.store.data.ownerKey;
         return k ? { bound: true, boundAt: k.boundAt, hint: k.hint, accounts: (k.accounts || []).length } : { bound: false, accounts: 0 };
     }
 
-    key(seed, salt) {
-        return crypto.scryptSync(seedBytes(seed), Buffer.from(salt, 'hex'), 32);
-    }
-
-    // привязать сид-фразу: сохраняем пароль кошелька, зашифрованный ключом из сида, и отдельно —
-    // ключом каждого из 21 счёта (для входа в кабинет одного счёта по его приватному ключу)
     bind(seed, walletPassword) {
-        const { deriveAccounts } = require('./erakeys');
-        const salt = crypto.randomBytes(16).toString('hex');
-        const norm = normalizeSeed(seed);
-        const accounts = deriveAccounts(norm).map((a) => {
-            const s = crypto.randomBytes(16).toString('hex');
-            return { n: a.n, address: a.address, salt: s, ...seal(this.accountKey(a.privateKey, s), walletPassword) };
-        });
-        this.store.data.ownerKey = {
-            salt, ...seal(this.key(seed, salt), walletPassword), boundAt: Date.now(),
-            hint: norm.slice(0, 4) + '…' + norm.slice(-4), // чтобы владелец узнал, какая фраза привязана
-            accounts,
-        };
+        this.store.data.ownerKey = sealIdentity(seed, walletPassword);
         this.store.save();
         return this.info();
-    }
-
-    accountKey(privateKey, salt) {
-        return crypto.scryptSync(base58Decode(privateKey), Buffer.from(salt, 'hex'), 32);
     }
 
     hasAccount(address) {
@@ -157,23 +177,33 @@ class OwnerKey {
         return !!(k && (k.accounts || []).some((a) => a.address === address));
     }
 
-    // вход по приватному ключу счёта: { account, walletPassword } или null, если ключ не из этого банка
+    addresses() {
+        const k = this.store.data.ownerKey;
+        return k ? (k.accounts || []).map((a) => a.address) : [];
+    }
+
+    // вход по приватному ключу счёта владельца: { account, walletPassword } или null
     unlockAccount(privateKey) {
         const { fromPrivateKey } = require('./erakeys');
         const acc = fromPrivateKey(privateKey);
         const k = this.store.data.ownerKey;
         if (!k) throw new BankError('Вход по ключу счёта ещё не настроен: владелец должен включить вход по сид-фразе', 409);
-        const box = (k.accounts || []).find((a) => a.address === acc.address);
-        if (!box) return null;
-        const walletPassword = open(this.accountKey(acc.privateKey, box.salt), box);
-        return walletPassword ? { account: { n: box.n, address: box.address }, walletPassword } : null;
+        return openByKey(k, acc);
+    }
+
+    // это фраза владельца? (по первому счёту; у старых привязок без счетов — пробуем расшифровать)
+    isOwnerSeed(seed) {
+        const k = this.store.data.ownerKey;
+        if (!k) return false;
+        if (k.accounts && k.accounts.length) return k.accounts[0].address === firstAddress(seed);
+        return openBySeed(k, seed) !== null;
     }
 
     // пароль кошелька по сид-фразе или null, если фраза не та
     unlock(seed) {
         const k = this.store.data.ownerKey;
         if (!k) throw new BankError('Вход по сид-фразе ещё не настроен: войдите паролем кошелька и привяжите фразу в «Настройки → Сид-фраза»', 409);
-        return open(this.key(seed, k.salt), k);
+        return openBySeed(k, seed);
     }
 
     unbind() {
@@ -183,4 +213,7 @@ class OwnerKey {
     }
 }
 
-module.exports = { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Encode, base58Decode };
+module.exports = {
+    OwnerKey, sealIdentity, openBySeed, openByKey, firstAddress,
+    generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Encode, base58Decode,
+};

@@ -15,7 +15,8 @@ const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
 const { Invoices } = require('./lib/invoices');
 const { Loans } = require('./lib/loans');
 const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed } = require('./lib/seed');
-const { ACCOUNTS, deriveAccounts } = require('./lib/erakeys');
+const { deriveAccounts } = require('./lib/erakeys');
+const { Clients } = require('./lib/clients');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -47,6 +48,7 @@ function createApp(backend, options = {}) {
     const invoices = new Invoices(backend, store);
     const loans = new Loans(backend, store);
     const ownerKey = new OwnerKey(store);
+    const clients = new Clients(store);
     // код первого запуска: без него чужой не создаст кошелёк, если сервер виден из сети раньше владельца
     const setupCode = options.setupCode || null;
     // демо: готовые сотрудники, открытая смена и привязанная сид-фраза, чтобы всё можно было опробовать сразу
@@ -99,12 +101,21 @@ function createApp(backend, options = {}) {
             sessions.delete(token);
             throw new BankError('Сессия истекла, войдите снова', 401);
         }
-        if (s.user.role === 'account') {
-            // кабинет по ключу счёта живёт, пока включён вход по сид-фразе
+        if (s.user.clientId) {
+            // клиент (или кабинет счёта клиента): доступ, пока клиент не приостановлен банком
+            const c = store.data.clients.find((x) => x.id === s.user.clientId);
+            if (!c || c.disabled) {
+                sessions.delete(token);
+                throw new BankError('Доступ клиента приостановлен банком', 401);
+            }
+            s.scope = s.user.role === 'account' ? [s.user.address] : clients.addresses(c);
+        } else if (s.user.role === 'account') {
+            // кабинет по ключу счёта владельца живёт, пока включён вход по сид-фразе
             if (!ownerKey.hasAccount(s.user.address)) {
                 sessions.delete(token);
                 throw new BankError('Вход по ключу счёта отключён владельцем', 401);
             }
+            s.scope = [s.user.address];
         } else if (s.user.role !== 'owner') {
             // отключённый или удалённый сотрудник теряет доступ сразу
             const u = store.data.staff.find((x) => x.id === s.user.id);
@@ -119,6 +130,7 @@ function createApp(backend, options = {}) {
             token,
             user: s.user,
             raw: s,
+            scope: s.scope || null, // счета клиента или кабинета по ключу; null — счета банка
             // пароль кошелька для операции: свой у владельца, у сотрудника — открытой смены
             get password() { return staff.walletPassword(s); },
         };
@@ -127,7 +139,8 @@ function createApp(backend, options = {}) {
     // права на маршрут: GET — просмотр, остальное — по разделу; список прав — все обязательны
     function permsFor(method, pathname) {
         if (pathname === '/api/logout' || pathname === '/api/me' || pathname === '/api/session/account') return [];
-        if (pathname === '/api/keys') return ['wallet'];
+        if (pathname === '/api/keys') return []; // ключи есть только у сессии, вошедшей фразой
+        if (pathname.startsWith('/api/clients')) return ['staff'];
         if (pathname.startsWith('/api/security')) return ['wallet'];
         if (pathname.startsWith('/api/loans')) {
             if (method === 'GET' || pathname === '/api/loans/preview') return ['read'];
@@ -231,30 +244,70 @@ function createApp(backend, options = {}) {
     const CABINET_GET = /^\/api\/(me|network|accounts|assets(\/\d+|\/types)?|polls(\/\d+)?|persons(\/\d+)?|catalog\/(statuses|templates)|exchange\/\d+\/\d+|documents\/verify\/\w+)$/;
     const CABINET_GET_OWN = /^\/api\/(?:accounts\/([^/]+)\/history|exchange\/orders\/([^/]+)|messages\/([^/]+))$/;
 
-    async function checkCabinet(req, url, address) {
+    // клиент и кабинет по ключу: только свои счета (scope)
+    async function checkCabinet(req, url, session) {
         const p = url.pathname;
-        const denied = () => new BankError('В кабинете счёта доступны только операции этого счёта', 403);
+        const own = new Set(session.scope);
+        const denied = () => new BankError('Здесь доступны только операции ваших счетов', 403);
+        const isClient = session.user.role === 'client';
         if (req.method === 'GET') {
-            if (CABINET_GET.test(p)) return;
+            if (CABINET_GET.test(p) || (isClient && p === '/api/keys')) return;
             const m = p.match(CABINET_GET_OWN);
-            if (m && (m[1] || m[2] || m[3]) === address) return;
-            if (p === '/api/bank/statement' && url.searchParams.get('address') === address) return;
+            if (m && own.has(decodeURIComponent(m[1] || m[2] || m[3]))) return;
+            if (p === '/api/bank/statement' && own.has(url.searchParams.get('address'))) return;
             throw denied();
         }
-        if (p === '/api/logout') return;
+        if (p === '/api/logout' || (isClient && p === '/api/session/account')) return;
         const rule = CABINET_SIGNER.find(([r]) => (typeof r === 'string' ? r === p : r.test(p)));
         if (!rule || req.method !== 'POST') throw denied();
         const body = await readJson(req);
-        if (body[rule[1]] !== address) throw denied();
+        if (!own.has(body[rule[1]])) throw denied();
     }
 
-    // в кошельке ноды должны быть все 21 счёт сид-фразы: недостающие открываем (нода выдаёт их по порядку)
+    // в кошельке ноды должны быть все 21 счёт сид-фразы: недостающие импортируем по их приватным ключам
     async function ensureAccounts(password, derived) {
         const have = new Set(await backend.walletAddresses(password));
-        for (let i = 0; i < ACCOUNTS + 5 && derived.some((a) => !have.has(a.address)); i++) {
-            have.add((await backend.openAccount(password)).address);
+        for (const a of derived) if (!have.has(a.address)) await backend.importKey(a.privateKey, password);
+        return derived.length;
+    }
+
+    // счета для списка: у клиента и кабинета — свои; у банка — кошелёк без счетов клиентов
+    async function accountsFor(session) {
+        const active = session.raw.active;
+        let list;
+        if (session.scope) {
+            const addrs = active ? [active] : session.scope;
+            list = backend.balances
+                ? await Promise.all(addrs.map(async (address) => ({ address, balances: await backend.balances(address) })))
+                : (await backend.accounts(session.password)).filter((a) => addrs.includes(a.address))
+                    .sort((x, y) => addrs.indexOf(x.address) - addrs.indexOf(y.address));
+        } else {
+            const foreign = new Set(store.data.clients.flatMap((c) => clients.addresses(c)));
+            list = (await backend.accounts(session.password)).filter((a) => !foreign.has(a.address) && (!active || a.address === active));
         }
-        return derived.filter((a) => !have.has(a.address)).map((a) => a.n);
+        const nums = new Map();
+        const ids = [ownerKey.identity(), ...store.data.clients].filter(Boolean);
+        for (const id of ids) for (const a of id.accounts || []) nums.set(a.address, a.n);
+        return list.map((a) => ({ ...a, n: nums.get(a.address) || null }));
+    }
+
+    function clientSession(c, walletPassword, keys = null, account = null) {
+        const user = account
+            ? { id: `key:${account.address}`, clientId: c.id, login: 'счёт №' + account.n, name: `Счёт №${account.n}`, role: 'account', address: account.address }
+            : { id: 'client:' + c.id, clientId: c.id, login: c.hint, name: c.name || 'Клиент ' + c.hint, role: 'client' };
+        const token = openSession(walletPassword, user);
+        if (keys) sessions.get(token).keys = keys;
+        if (account) sessions.get(token).active = account.address;
+        return { token, user, shift: staff.shiftInfo(), keys: keys ? keys.length : 0 };
+    }
+
+    async function checkWalletOpen(walletPassword, ownerMessage) {
+        try {
+            await backend.login(walletPassword);
+        } catch (e) {
+            if (e.status === 502) throw e;
+            throw new BankError(ownerMessage || 'Пароль кошелька на ноде изменился: обратитесь в банк', 409);
+        }
     }
 
     async function requireNoWallet() {
@@ -295,7 +348,8 @@ function createApp(backend, options = {}) {
         }, { public: true }],
         ['POST', '/api/setup/seed', async () => {
             await requireNoWallet();
-            return { seed: formatSeed(generateSeed()) };
+            const seed = generateSeed();
+            return { seed: formatSeed(seed), keys: deriveAccounts(seed) };
         }, { public: true }],
         ['POST', '/api/setup/create', async ({ req, ip }) => {
             checkThrottle(ip);
@@ -316,6 +370,35 @@ function createApp(backend, options = {}) {
             return ownerSession(password, keys);
         }, { public: true }],
 
+        // регистрация клиента: новая сид-фраза (или своя) → 21 счёт в кошельке банка → вход
+        ['POST', '/api/register/new', ({ ip }) => {
+            publicLimit(ip);
+            const seed = generateSeed();
+            return { seed, keys: deriveAccounts(seed) };
+        }, { public: true }],
+        ['POST', '/api/register', async ({ req, ip }) => {
+            checkThrottle(ip);
+            publicLimit(ip);
+            const body = await readJson(req);
+            const prep = clients.prepare(body);
+            if (ownerKey.isOwnerSeed(prep.seed)) throw new BankError('Это сид-фраза владельца банка — войдите по ней', 409);
+            let walletPassword;
+            try {
+                walletPassword = staff.walletPassword({ password: null });
+            } catch (e) {
+                throw new BankError('Регистрация доступна, когда банк работает (открыта смена). Попробуйте позже', 423);
+            }
+            await ensureAccounts(walletPassword, prep.keys);
+            const c = clients.add(prep, walletPassword);
+            // приветственные COMPU на комиссии сети — с первого счёта банка (если задано)
+            const bankMain = ownerKey.addresses()[0];
+            if (options.welcomeCompu && bankMain) {
+                await backend.transfer({ from: bankMain, to: prep.keys[0].address, asset: 2, amount: String(options.welcomeCompu), title: 'Добро пожаловать в банк' }, walletPassword)
+                    .catch((e) => console.warn('приветственные COMPU:', e.message));
+            }
+            return clientSession(c, walletPassword, prep.keys);
+        }, { public: true }],
+
         ['POST', '/api/login', async ({ req, ip }) => {
             checkThrottle(ip);
             const { login, password, seed, key } = await readJson(req);
@@ -323,29 +406,38 @@ function createApp(backend, options = {}) {
                 // кабинет одного счёта по его приватному ключу
                 let r;
                 try {
-                    r = ownerKey.unlockAccount(key);
+                    r = clients.unlockAccount(key) || (ownerKey.bound() ? ownerKey.unlockAccount(key) : null);
                 } catch (e) {
                     if (e.status !== 409) loginFailed(ip);
                     throw e;
                 }
                 if (!r) {
                     loginFailed(ip);
-                    throw new BankError('Ключ не подходит ни к одному из 21 счёта этого банка', 401);
+                    throw new BankError('Ключ не подходит ни к одному счёту этого банка', 401);
                 }
-                try {
-                    await backend.login(r.walletPassword);
-                } catch (e) {
-                    if (e.status === 502) throw e;
-                    throw new BankError('Пароль кошелька на ноде изменился: владелец должен привязать сид-фразу заново', 409);
-                }
+                await checkWalletOpen(r.walletPassword);
                 failures.delete(ip);
+                if (r.client) return clientSession(r.client, r.walletPassword, null, r.account);
                 const user = { id: 'key:' + r.account.address, login: 'счёт №' + r.account.n, name: `Счёт №${r.account.n}`, role: 'account', address: r.account.address };
                 const token = openSession(r.walletPassword, user);
                 sessions.get(token).active = r.account.address;
                 return { token, user, shift: staff.shiftInfo() };
             }
             if (seed !== undefined) {
-                // вход владельца по сид-фразе: из неё расшифровывается пароль кошелька
+                // по сид-фразе входят владелец и клиенты: из неё расшифровывается пароль кошелька
+                seedBytes(seed);
+                if (!ownerKey.isOwnerSeed(seed)) {
+                    const c = clients.unlock(seed);
+                    if (c) {
+                        await checkWalletOpen(c.walletPassword);
+                        failures.delete(ip);
+                        return clientSession(c.client, c.walletPassword, deriveAccounts(seed));
+                    }
+                    if (ownerKey.bound()) {
+                        loginFailed(ip);
+                        throw new BankError('Сид-фраза не найдена в банке: проверьте её или зарегистрируйтесь', 401);
+                    }
+                }
                 let walletPassword;
                 try {
                     walletPassword = ownerKey.unlock(seed);
@@ -416,11 +508,15 @@ function createApp(backend, options = {}) {
                 session.raw.active = null;
                 return { active: null };
             }
-            const own = await backend.walletAddresses(session.password);
-            if (!own.includes(address)) throw new BankError('Такого счёта нет в кошельке банка', 404);
+            const own = session.scope || (await backend.walletAddresses(session.password)).filter((a) => !clients.owns(a));
+            if (!own.includes(address)) throw new BankError('Такого счёта нет среди ваших счетов', 404);
             session.raw.active = address;
             return { active: address };
         }],
+
+        // клиенты банка (для сотрудников с правом «сотрудники»)
+        ['GET', '/api/clients', () => clients.list()],
+        ['PATCH', /^\/api\/clients\/([\w-]+)$/, async ({ req, m }) => clients.setDisabled(m[1], (await readJson(req)).disabled)],
 
         // сотрудники, смена, журнал
         ['GET', '/api/staff', () => ({ staff: staff.list(), roles: Staff.roles() })],
@@ -467,12 +563,7 @@ function createApp(backend, options = {}) {
         }],
 
         // счета и переводы
-        ['GET', '/api/accounts', async ({ session }) => {
-            const list = await backend.accounts(session.password);
-            // в кабинете — только выбранный счёт; номер счёта сид-фразы, если он известен
-            const nums = new Map((store.data.ownerKey && store.data.ownerKey.accounts || []).map((a) => [a.address, a.n]));
-            return list.filter((a) => !session.raw.active || a.address === session.raw.active).map((a) => ({ ...a, n: nums.get(a.address) || null }));
-        }],
+        ['GET', '/api/accounts', ({ session }) => accountsFor(session)],
         ['POST', '/api/accounts', ({ session }) => backend.openAccount(session.password)],
         ['GET', /^\/api\/accounts\/([^/]+)\/history$/, ({ m, url, session }) => {
             const address = decodeURIComponent(m[1]);
@@ -671,7 +762,7 @@ function createApp(backend, options = {}) {
             const r = route(req.method, url.pathname);
             if (!r) throw new BankError('Метод не найден', 404);
             session = r.opts.public ? null : requireSession(req);
-            if (session && session.user.role === 'account') await checkCabinet(req, url, session.user.address);
+            if (session && session.scope) await checkCabinet(req, url, session);
             if (session) for (const perm of permsFor(req.method, url.pathname)) Staff.require(session.user, perm);
             body = await r.handler({ req, url, m: r.m, session, ip });
         } catch (e) {
@@ -680,9 +771,10 @@ function createApp(backend, options = {}) {
             if (!(e instanceof BankError)) console.error(e);
         }
         // журнал: все действия, кроме просмотра (GET) и запросов без входа, кроме попыток входа
-        if (req.method !== 'GET' && (session || url.pathname === '/api/login' || url.pathname === '/api/setup/create')) {
+        if (req.method !== 'GET' && (session || ['/api/login', '/api/setup/create', '/api/register'].includes(url.pathname))) {
             const user = session ? session.user : (status === 200 && body && body.user)
-                || { login: (req.bankBody && req.bankBody.login) || (req.bankBody && req.bankBody.seed !== undefined ? 'owner (сид-фраза)' : 'owner?'), role: '—' };
+                || { login: (req.bankBody && req.bankBody.login) || (req.bankBody && req.bankBody.seed !== undefined ? 'сид-фраза'
+                    : req.bankBody && req.bankBody.key !== undefined ? 'ключ счёта' : 'owner?'), role: '—' };
             try {
                 staff.audit({ user, ip, action: `${req.method} ${url.pathname}`, body: req.bankBody, ok: status < 400, error: status < 400 ? null : body.error });
             } catch (e) {
@@ -759,6 +851,7 @@ if (require.main === module) {
             : new JsonStore(path.join(dataDir, 'gateway.json'), {}),
         webhookSecret: process.env.BANK_WEBHOOK_SECRET || '',
         setupCode,
+        welcomeCompu: demo ? '0.01' : process.env.BANK_WELCOME_COMPU || null,
         demoStaff: demo ? DEMO_STAFF : null,
         sbpClient: demo ? new SbpEmulator()
             : process.env.TOCHKA_SBP_TOKEN ? new TochkaSbpClient({

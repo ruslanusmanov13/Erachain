@@ -87,7 +87,7 @@ export default {
             }
         });
         // в кабинете одного счёта новые счета не открываются
-        const cabinet = state.me && state.me.active;
+        const cabinet = state.me && (state.me.active || ['account', 'client'].includes(state.me.user.role));
         root.append(el('div', { class: 'row between' }, el('h3', { class: 'section-title' }, cabinet ? 'Счёт' : 'Счета'), cabinet ? null : newBtn), strip);
 
         const acc = currentAccount();

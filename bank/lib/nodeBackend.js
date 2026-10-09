@@ -15,17 +15,18 @@ class NodeBackend {
         this.assetCache = new Map();
     }
 
-    async call(path, { query = {}, body } = {}) {
+    async call(path, { query = {}, body, raw: rawBody } = {}) {
         const url = new URL(this.rpcUrl + '/' + path);
         for (const [k, v] of Object.entries(query)) {
             if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
         }
         let res;
         try {
+            // raw — тело как есть (текстом), body — JSON
             res = await fetch(url, {
-                method: body === undefined ? 'GET' : 'POST',
-                headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-                body: body === undefined ? undefined : JSON.stringify(body),
+                method: body === undefined && rawBody === undefined ? 'GET' : 'POST',
+                headers: rawBody !== undefined ? { 'Content-Type': 'text/plain' } : body === undefined ? undefined : { 'Content-Type': 'application/json' },
+                body: rawBody !== undefined ? rawBody : body === undefined ? undefined : JSON.stringify(body),
                 signal: AbortSignal.timeout(this.timeoutMs),
             });
         } catch (e) {
@@ -104,6 +105,16 @@ class NodeBackend {
         const r = await this.call('wallet', { body: { seed, password, amount: ACCOUNTS } });
         if (String(r) !== 'true') throw new BankError('Нода не смогла создать кошелёк');
         return true;
+    }
+
+    // импорт счёта в кошелёк ноды по приватному ключу (ключ счёта Base58); уже импортированный — не ошибка
+    async importKey(privateKey, password) {
+        try {
+            return String(await this.call('addresses/importaccountseed', { query: { password }, raw: privateKey }));
+        } catch (e) {
+            if (/already exist/i.test(e.message)) return null;
+            throw e;
+        }
     }
 
     async walletAddresses(password) {

@@ -1,7 +1,7 @@
 // Точка входа: маршрутизация по #/раздел, вход в кошелёк, настройка адреса сервера.
 import { get, post, session, setUnauthorizedHandler, needsServer, isNative, serverUrl, setServerUrl } from './api.js';
 import { $, el, card, field, input, form, toast, spinner, confirm, tabs } from './ui.js';
-import { setupWizard, seedInput } from './seed.js';
+import { setupWizard, seedInput, registerView } from './seed.js';
 import { state, loadAccounts, loadMe } from './state.js';
 import home from './views/home.js';
 import transfer from './views/transfer.js';
@@ -73,6 +73,7 @@ function cabinetBar(name) {
 }
 
 function loggedIn(token, hash = '#/home') {
+    loginTab = 'login'; // после выхода — снова экран входа
     session.setToken(token);
     state.accounts = [];
     state.me = null;
@@ -101,13 +102,15 @@ async function showEntry() {
 const serverLine = () => (isNative() ? el('p', { class: 'center small muted' }, 'Сервер: ' + serverUrl() + ' · ',
     el('a', { href: '#', onclick: (e) => { e.preventDefault(); setServerUrl(null); render(); } }, 'изменить')) : '');
 
-let loginTab = 'owner';
+let loginTab = 'login';
+let loginMethod = 'seed';
 
 function showLogin(setup) {
     $('nav').classList.add('hidden');
     $('pageTitle').textContent = 'Банк Erachain';
     const body = el('div', {});
-    const ownerForm = (byPassword) => {
+    const methodBody = el('div', {});
+    const seedForm = (byPassword) => {
         const f = form([
             byPassword
                 ? field('Пароль кошелька ноды', input('password', { type: 'password', autocomplete: 'current-password', required: true }))
@@ -117,17 +120,17 @@ function showLogin(setup) {
             formEl.reset();
             loggedIn(r.token, r.keys ? '#/keys' : '#/home');
         });
-        const toggle = el('a', { href: '#', class: 'small' }, byPassword ? 'Войти сид-фразой' : 'Войти паролем кошелька');
+        const toggle = el('a', { href: '#', class: 'small' }, byPassword ? 'Войти сид-фразой' : 'Владелец: войти паролем кошелька');
         toggle.addEventListener('click', (e) => {
             e.preventDefault();
-            body.replaceChildren(...ownerForm(!byPassword));
+            methodBody.replaceChildren(...seedForm(!byPassword));
         });
         return [
             el('p', { class: 'muted small' }, byPassword
-                ? 'Запасной вход владельца. Пароль передаётся только серверу банка и не сохраняется на устройстве.'
-                : 'Владелец банка входит сид-фразой — главным ключом кошелька. Сотрудникам она не нужна.'),
+                ? 'Запасной вход владельца банка. Пароль передаётся только серверу банка и не сохраняется на устройстве.'
+                : 'Владелец банка и клиенты входят своей сид-фразой — 44 символа Base58. Фраза нигде не сохраняется.'),
             f,
-            setup.seedLogin || byPassword ? el('p', { class: 'center' }, toggle) : null,
+            el('p', { class: 'center' }, toggle),
         ];
     };
     const staffForm = () => [
@@ -142,23 +145,32 @@ function showLogin(setup) {
         }),
     ];
     const keyForm = () => [
-        el('p', { class: 'muted small' }, 'Приватный ключ одного из 21 счёта банка открывает кабинет только этого счёта: остатки, переводы, документы, голосования.'),
+        el('p', { class: 'muted small' }, 'Приватный ключ одного счёта открывает кабинет только этого счёта: остатки, переводы, документы, голосования.'),
         form([
-            field('Приватный ключ счёта', seedInput('key', { placeholder: '44 символа Base58' }), 'Ключ выдаёт владелец банка. Он нигде не сохраняется'),
+            field('Приватный ключ счёта', seedInput('key', { placeholder: '44 символа Base58' }), 'Ключ есть в файле счёта. Он нигде не сохраняется'),
         ], 'Войти в кабинет', async (data, formEl) => {
             const { token } = await post('login', { key: data.key });
             formEl.reset();
             loggedIn(token);
         }),
     ];
-    // пока сид-фраза не привязана, владелец входит паролем кошелька
+    const showMethod = (k) => {
+        loginMethod = k;
+        methodBody.replaceChildren(...(k === 'staff' ? staffForm() : k === 'key' ? keyForm() : seedForm(false)));
+    };
     const show = (k) => {
         loginTab = k;
-        body.replaceChildren(...(k === 'staff' ? staffForm() : k === 'key' ? keyForm() : ownerForm(!setup.seedLogin)));
+        if (k === 'register') {
+            body.replaceChildren(registerView(loggedIn));
+            return;
+        }
+        showMethod(loginMethod);
+        body.replaceChildren(el('div', { class: 'tabs-sub' },
+            tabs([['seed', 'Сид-фраза'], ['key', 'Ключ счёта'], ['staff', 'Сотрудник']], loginMethod, showMethod)), methodBody);
     };
     show(loginTab);
     $('view').replaceChildren(el('div', { class: 'login-wrap' },
-        card(el('h2', {}, 'Вход'), tabs([['owner', 'Владелец'], ['key', 'Ключ счёта'], ['staff', 'Сотрудник']], loginTab, show), body),
+        card(tabs([['login', 'Вход'], ['register', 'Регистрация']], loginTab, show), body),
         serverLine(),
     ));
 }
@@ -190,7 +202,7 @@ function showServerSetup() {
 function showUser() {
     const me = state.me;
     if (!me) return;
-    const shift = ['owner', 'account'].includes(me.user.role) ? '' : me.shift.open ? ' · смена открыта' : ' · смена закрыта';
+    const shift = ['owner', 'account', 'client'].includes(me.user.role) ? '' : me.shift.open ? ' · смена открыта' : ' · смена закрыта';
     $('status').dataset.user = `${me.user.name} (${me.role.toLowerCase()})${shift}`;
     $('status').title = $('status').dataset.user;
 }

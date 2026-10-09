@@ -91,6 +91,10 @@ export async function saveFile(filename, base64, mime) {
         await plugins.Share.share({ title: filename, url: written.uri, dialogTitle: 'Сохранить или отправить файл' });
         return;
     }
+    webDownload(filename, base64, mime);
+}
+
+function webDownload(filename, base64, mime) {
     const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
     const url = URL.createObjectURL(new Blob([bytes], { type: mime || 'application/octet-stream' }));
     const a = document.createElement('a');
@@ -100,4 +104,45 @@ export async function saveFile(filename, base64, mime) {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+export function textToBase64(text) {
+    const bytes = new TextEncoder().encode(text);
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin);
+}
+
+// «Скачать файлом»: Android — в «Документы/Erachain», браузер — в загрузки. Возвращает, куда сохранено.
+export async function downloadFile(filename, base64, mime) {
+    if (typeof window.bankSaveFileHook === 'function') return window.bankSaveFileHook(filename, base64, mime);
+    const plugins = window.Capacitor && window.Capacitor.Plugins;
+    if (isNative() && plugins && plugins.Filesystem) {
+        try {
+            await plugins.Filesystem.writeFile({ path: 'Erachain/' + filename, data: base64, directory: 'DOCUMENTS', recursive: true });
+            return 'Документы/Erachain/' + filename;
+        } catch (e) {
+            await saveFile(filename, base64, mime); // нет доступа к «Документам» — через «Поделиться»
+            return null;
+        }
+    }
+    webDownload(filename, base64, mime);
+    return 'Загрузки/' + filename;
+}
+
+// «Сохранить»: системное окно «Поделиться» — Google Диск, Telegram, почта, «Файлы»
+export async function shareFile(filename, base64, mime) {
+    if (typeof window.bankSaveFileHook === 'function') return window.bankSaveFileHook(filename, base64, mime);
+    if (isNative()) return saveFile(filename, base64, mime);
+    try {
+        const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+        const file = new File([bytes], filename, { type: mime || 'text/plain' });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+            await navigator.share({ files: [file], title: filename });
+            return;
+        }
+    } catch (e) {
+        if (e && e.name === 'AbortError') return;
+    }
+    webDownload(filename, base64, mime);
 }

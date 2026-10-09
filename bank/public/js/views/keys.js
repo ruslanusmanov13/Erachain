@@ -2,7 +2,7 @@
 import { get, post } from '../api.js';
 import { el, card, fmt, toast, openDialog, closeDialog, empty } from '../ui.js';
 import { state, loadAccounts, loadMe, setCurrent, balanceOf } from '../state.js';
-import { seedBox } from '../seed.js';
+import { seedBox, fileButtons } from '../seed.js';
 
 export async function enterCabinet(address) {
     await post('session/account', { address });
@@ -31,7 +31,8 @@ export default {
         const byAddress = new Map(accounts.map((a) => [a.address, a]));
         const rows = keys || accounts.filter((a) => a.n).sort((x, y) => x.n - y.n).map((a) => ({ n: a.n, address: a.address }));
 
-        const all = el('button', { class: 'btn block', type: 'button' }, 'Все счета банка (без кабинета)');
+        const client = state.me && state.me.user.role === 'client';
+        const all = el('button', { class: 'btn block', type: 'button' }, client ? 'Все мои счета (без кабинета)' : 'Все счета банка (без кабинета)');
         all.addEventListener('click', async () => { location.hash = '#/home'; });
 
         const list = rows.length ? el('div', { class: 'list' }, rows.map((k) => {
@@ -64,6 +65,8 @@ export default {
                     ? 'Из сид-фразы получены 21 счёт с приватными ключами (стандарт Erachain). Выберите счёт, чтобы войти в его кабинет, или откройте ключ, чтобы выдать доступ к одному счёту.'
                     : 'Приватные ключи показываются только после входа по сид-фразе. Войти в кабинет любого счёта можно и сейчас.'),
                 all),
+            keys ? card(el('h3', {}, 'Файл с ключами'), el('p', { class: 'small muted' }, '21 адрес и приватный ключ — для резервной копии или импорта в кошелёк Erachain. Сид-фраза в файл не входит: банк её не хранит.'),
+                fileButtons({ keys, name: state.me ? state.me.user.name : '' }, { copyLabel: 'Копировать' })) : null,
             card(list));
     },
 };

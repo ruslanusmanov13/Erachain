@@ -716,7 +716,7 @@ test('первый запуск: создание банка по сид-фра�
     assert.ok((await api('GET', '/api/accounts', null, token)).data.length > 0);
     r = await api('POST', '/api/login', { seed: require('../lib/seed').generateSeed() });
     assert.strictEqual(r.status, 401);
-    assert.match(r.data.error, /не подходит/);
+    assert.match(r.data.error, /не найдена в банке/);
 
     // показать фразу — только с паролем; перепривязка проверяет совпадение с кошельком
     assert.strictEqual((await api('POST', '/api/security/seed/show', { password: 'wrongpass1' }, token)).status, 403, 'не выкидывает из сессии');
@@ -813,9 +813,87 @@ test('21 ключ: вход по сид-фразе, выбор кабинета,
     // чужой ключ и ключ не из банка
     r = await api('POST', '/api/login', { key: require('../lib/seed').generateSeed() });
     assert.strictEqual(r.status, 401);
-    assert.match(r.data.error, /ни к одному из 21/);
+    assert.match(r.data.error, /ни к одному счёту/);
 
     // владелец отключил вход по фразе — кабинеты по ключам закрываются
     await api('POST', '/api/security/seed/unbind', { password: 'demo12345' }, owner);
     assert.strictEqual((await api('GET', '/api/accounts', null, cab)).status, 401);
+});
+
+test('регистрация клиента: своя сид-фраза, 21 счёт, вход по фразе и ключу, только свои счета', async (t) => {
+    const { DEMO_STAFF, DEMO_SEED } = require('../server');
+    const { deriveAccounts } = require('../lib/erakeys');
+    const backend = new DemoBackend({ seed: DEMO_SEED });
+    const store = new JsonStore(null, {});
+    const server = createServer(backend, { store, demoStaff: DEMO_STAFF, welcomeCompu: '0.01' });
+    const base = await listen(server);
+    t.after(() => server.close());
+    const api = async (method, path, body, token) => {
+        const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+        return { status: res.status, data: await res.json() };
+    };
+    const bank = deriveAccounts(DEMO_SEED);
+
+    // 1. сгенерировать счёт: фраза и 21 ключ, ничего не сохраняется
+    let r = await api('POST', '/api/register/new');
+    const { seed, keys } = r.data;
+    assert.match(seed, /^[1-9A-HJ-NP-Za-km-z]{43,44}$/);
+    assert.strictEqual(keys.length, 21);
+    assert.deepStrictEqual(keys, deriveAccounts(seed));
+    assert.strictEqual(store.data.clients.length, 0);
+
+    // 2. зарегистрироваться — сразу вход клиента, 21 счёт в кошельке ноды
+    r = await api('POST', '/api/register', { seed, name: 'Пётр Петров' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual(r.data.user.role, 'client');
+    assert.strictEqual(r.data.keys, 21);
+    const cli = r.data.token;
+    assert.ok(keys.every((k) => backend.accountsMap.has(k.address)));
+    assert.strictEqual((await api('POST', '/api/register', { seed })).status, 409, 'повторно нельзя');
+    assert.strictEqual((await api('POST', '/api/register', { seed: DEMO_SEED })).status, 409, 'фраза владельца');
+    const stored = JSON.stringify(store.data.clients);
+    assert.ok(!stored.includes(seed) && !keys.some((k) => stored.includes(k.privateKey)), 'фраза и ключи не хранятся');
+
+    // клиент видит только свои 21 счёт и свои ключи
+    r = await api('GET', '/api/accounts', null, cli);
+    assert.deepStrictEqual(r.data.map((a) => a.address), keys.map((k) => k.address));
+    assert.deepStrictEqual(r.data.map((a) => a.n), keys.map((k) => k.n));
+    assert.strictEqual(bal(r.data[0], 2), '0.01000000', 'приветственные COMPU на комиссии');
+    assert.strictEqual((await api('GET', '/api/keys', null, cli)).data.length, 21);
+    // переводит со своего счёта, но не с банковского
+    await api('POST', '/api/transfer', { from: bank[0].address, to: keys[0].address, asset: 1, amount: '10' }, (await api('POST', '/api/login', { seed: DEMO_SEED })).data.token);
+    r = await api('POST', '/api/transfer', { from: keys[0].address, to: keys[1].address, asset: 1, amount: '2' }, cli);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual((await api('POST', '/api/transfer', { from: bank[0].address, to: keys[1].address, asset: 1, amount: '1' }, cli)).status, 403);
+    for (const [m, p] of [['GET', '/api/staff'], ['GET', '/api/clients'], ['GET', '/api/bank/deposits'], ['GET', '/api/loans'], ['POST', '/api/accounts']]) {
+        assert.strictEqual((await api(m, p, m === 'POST' ? {} : null, cli)).status, 403, `${m} ${p}`);
+    }
+    // кабинет одного из своих счетов
+    assert.strictEqual((await api('POST', '/api/session/account', { address: bank[0].address }, cli)).status, 404);
+    await api('POST', '/api/session/account', { address: keys[4].address }, cli);
+    assert.deepStrictEqual((await api('GET', '/api/accounts', null, cli)).data.map((a) => a.address), [keys[4].address]);
+
+    // 3. повторный вход по фразе и по ключу счёта клиента
+    r = await api('POST', '/api/login', { seed });
+    assert.strictEqual(r.data.user.role, 'client');
+    r = await api('POST', '/api/login', { key: keys[2].privateKey });
+    assert.strictEqual(r.data.user.role, 'account');
+    assert.deepStrictEqual((await api('GET', '/api/accounts', null, r.data.token)).data.map((a) => a.address), [keys[2].address]);
+
+    // банк: счета клиентов не смешиваются со счетами банка; список клиентов; приостановка доступа
+    const owner = (await api('POST', '/api/login', { seed: DEMO_SEED })).data.token;
+    r = await api('GET', '/api/accounts', null, owner);
+    assert.strictEqual(r.data.length, 21);
+    assert.ok(!r.data.some((a) => keys.some((k) => k.address === a.address)));
+    r = await api('GET', '/api/clients', null, owner);
+    assert.deepStrictEqual(r.data.map((c) => [c.name, c.address, c.accounts]), [['Пётр Петров', keys[0].address, 21]]);
+    await api('PATCH', '/api/clients/' + r.data[0].id, { disabled: true }, owner);
+    assert.strictEqual((await api('GET', '/api/accounts', null, cli)).status, 401);
+    assert.strictEqual((await api('POST', '/api/login', { seed })).status, 403);
+
+    // смена закрыта — регистрация недоступна
+    await api('POST', '/api/shift/close', {}, owner);
+    const seed2 = (await api('POST', '/api/register/new')).data.seed;
+    r = await api('POST', '/api/register', { seed: seed2 });
+    assert.strictEqual(r.status, 423);
 });

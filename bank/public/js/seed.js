@@ -1,5 +1,5 @@
 // Сид-фраза: мастер первого запуска (создать банк или восстановить), показ и привязка фразы владельцем.
-import { get, post } from './api.js';
+import { get, post, downloadFile, shareFile, textToBase64 } from './api.js';
 import { el, card, field, input, form, toast, date, kv, badge, copy, openDialog, closeDialog } from './ui.js';
 
 // фраза и ключи — одной строкой Base58 (44 символа), как в кошельке Erachain
@@ -18,13 +18,15 @@ export function seedInput(name = 'seed', attrs = {}) {
     });
 }
 
-const WARN = () => el('div', { class: 'warn-box' },
-    el('b', {}, 'Сид-фраза — это все деньги банка.'),
+const WARN = (client = false) => el('div', { class: 'warn-box' },
+    el('b', {}, client ? 'Сид-фраза — это ваши деньги.' : 'Сид-фраза — это все деньги банка.'),
     el('ul', {},
-        el('li', {}, 'Запишите её на бумаге и храните в сейфе. Лучше — две копии в разных местах.'),
+        el('li', {}, 'Запишите её на бумаге или сохраните файл в надёжном месте. Лучше — две копии в разных местах.'),
         el('li', {}, 'Не делайте скриншот, не пересылайте в мессенджерах и почте, не храните в заметках.'),
-        el('li', {}, 'Кто знает фразу, тот распоряжается всеми 21 счётом банка. Сотрудникам она не нужна — у них свой логин и пароль.'),
-        el('li', {}, 'Потеряете фразу и пароль кошелька — доступ к счетам не восстановить.')));
+        client
+            ? el('li', {}, 'Кто знает фразу, тот распоряжается всеми 21 вашим счётом. Банк её не хранит и никогда не спросит.')
+            : el('li', {}, 'Кто знает фразу, тот распоряжается всеми 21 счётом банка. Сотрудникам она не нужна — у них свой логин и пароль.'),
+        el('li', {}, client ? 'Потеряете фразу — войти можно будет только по ключам счетов из файла.' : 'Потеряете фразу и пароль кошелька — доступ к счетам не восстановить.')));
 
 function passwordFields(needCode) {
     return [
@@ -61,8 +63,9 @@ export function setupWizard(setup, onDone) {
 
     async function newSeed() {
         let seed;
+        let keys;
         try {
-            seed = (await post('setup/seed')).seed;
+            ({ seed, keys } = await post('setup/seed'));
         } catch (e) {
             toast(e.message);
             return;
@@ -74,8 +77,10 @@ export function setupWizard(setup, onDone) {
         step(
             el('h2', {}, 'Шаг 1 из 3. Запишите сид-фразу'),
             el('p', { class: 'small muted' }, 'Из этой фразы будут созданы 21 счёт банка с приватными ключами. Различайте заглавные и строчные буквы.'),
-            seedBox(seed), WARN(),
-            el('label', { class: 'check-row' }, agree, el('span', {}, 'Я записал(а) сид-фразу на бумаге и понимаю, что без неё доступ к деньгам не восстановить')),
+            seedBox(seed, { copyable: false }),
+            keys ? fileButtons({ seed, keys, name: 'Владелец банка' }, { copyText: seed, copyLabel: 'Копировать фразу' }) : null,
+            WARN(),
+            el('label', { class: 'check-row' }, agree, el('span', {}, 'Я записал(а) или сохранил(а) сид-фразу и понимаю, что без неё доступ к деньгам не восстановить')),
             next,
             el('button', { class: 'btn block', type: 'button', onclick: start }, 'Назад'));
     }
@@ -187,4 +192,121 @@ export async function seedSettingsCard() {
         info.bound ? el('a', { class: 'btn soft block', href: '#/keys' }, '21 ключ и кабинеты счетов') : null,
         show, bind, unbind);
     return card(el('h2', {}, 'Сид-фраза'), body);
+}
+
+// ---------- файл счёта ----------
+
+// текст файла: фраза (если есть) и 21 счёт с приватными ключами
+export function accountFile({ seed = null, keys, name = '' }) {
+    const lines = [
+        'БАНК ERACHAIN — ДАННЫЕ СЧЁТА',
+        `Создан: ${new Date().toLocaleString('ru-RU')}` + (name ? ` · ${name}` : ''),
+        '',
+        'Храните файл в надёжном месте (лучше — распечатайте и удалите с устройства).',
+        'Кто знает сид-фразу, распоряжается всеми 21 счётом. Кто знает приватный ключ — этим счётом.',
+        '',
+    ];
+    if (seed) lines.push('СИД-ФРАЗА (вход в банк и восстановление всех счетов):', String(seed).replace(/\s+/g, ''), '');
+    lines.push(`ОСНОВНОЙ СЧЁТ №1 (для пополнения): ${keys[0].address}`, '', 'СЧЕТА И ПРИВАТНЫЕ КЛЮЧИ:');
+    for (const k of keys) lines.push(`№${String(k.n).padStart(2, ' ')}  ${k.address}  ${k.privateKey || ''}`.trimEnd());
+    lines.push('', 'Ключи совместимы с кошельком Erachain (импорт счёта по ключу, восстановление по сид-фразе).');
+    return { filename: `erachain-${keys[0].address.slice(0, 10)}.txt`, text: lines.join('\r\n') + '\r\n' };
+}
+
+// три кнопки: «Скачать файлом», «Сохранить», «Копировать»
+export function fileButtons(data, { copyText, copyLabel = 'Копировать' } = {}) {
+    const f = accountFile(data);
+    const b64 = () => textToBase64(f.text);
+    const run = (fn) => async (e) => {
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        try {
+            await fn();
+        } catch (err) {
+            toast(err.message || 'Не удалось сохранить файл');
+        } finally {
+            btn.disabled = false;
+        }
+    };
+    return el('div', { class: 'file-actions' },
+        el('button', { class: 'btn primary', type: 'button', onclick: run(async () => {
+            const where = await downloadFile(f.filename, b64(), 'text/plain; charset=utf-8');
+            if (where) toast('Файл сохранён: ' + where);
+        }) }, 'Скачать файлом'),
+        el('button', { class: 'btn', type: 'button', onclick: run(() => shareFile(f.filename, b64(), 'text/plain; charset=utf-8')) }, 'Сохранить'),
+        el('button', { class: 'btn', type: 'button', onclick: run(() => copy(copyText || f.text, 'Скопировано — не оставляйте в буфере надолго')) }, copyLabel));
+}
+
+function keysList(keys) {
+    return el('details', { class: 'keys-details' },
+        el('summary', {}, `Все 21 счёт и приватные ключи`),
+        el('div', { class: 'list' }, keys.map((k) => el('div', { class: 'list-item key-row' },
+            el('div', { class: 'icon-circle' }, String(k.n)),
+            el('div', { class: 'grow' },
+                el('div', { class: 'title mono small' }, k.address),
+                el('div', { class: 'sub mono tiny' }, k.privateKey))))));
+}
+
+/** Регистрация: создать счёт (новая фраза и 21 ключ) или подключить свою фразу. onDone(token, hash) — вход. */
+export function registerView(onDone) {
+    const box = el('div', {});
+    const step = (...children) => box.replaceChildren(...children);
+
+    const register = async (seed, name) => {
+        const r = await post('register', { seed, name });
+        toast('Счёт открыт. Добро пожаловать!');
+        onDone(r.token, '#/keys');
+    };
+
+    const start = () => step(
+        el('p', { class: 'muted small' }, 'Создайте счёт в банке: будет сгенерирована сид-фраза и 21 счёт с приватными ключами (стандарт Erachain). Сид-фраза — ваш вход в банк.'),
+        form([
+            field('Ваше имя или организация', input('name', { maxlength: 120, autocomplete: 'name', placeholder: 'Необязательно' })),
+        ], 'Создать счёт', async (d) => {
+            const r = await post('register/new');
+            created(r.seed, r.keys, d.name.trim());
+        }),
+        el('p', { class: 'center' }, el('a', { href: '#', class: 'small', onclick: (e) => { e.preventDefault(); own(); } }, 'У меня уже есть сид-фраза Erachain')));
+
+    function created(seed, keys, name) {
+        const agree = el('input', { type: 'checkbox' });
+        const next = el('button', { class: 'btn primary block', type: 'button', disabled: true }, 'Зарегистрироваться и войти');
+        agree.addEventListener('change', () => { next.disabled = !agree.checked; });
+        const err = el('p', { class: 'error' });
+        next.addEventListener('click', async () => {
+            next.disabled = true;
+            err.textContent = '';
+            try {
+                await register(seed, name);
+            } catch (e) {
+                err.textContent = e.message;
+                next.disabled = false;
+            }
+        });
+        step(
+            el('h3', {}, 'Ваш новый счёт'),
+            el('div', { class: 'tiny muted' }, 'Сид-фраза'),
+            seedBox(seed, { copyable: false }),
+            kv([['Основной счёт №1', el('span', { class: 'mono small' }, keys[0].address)]]),
+            fileButtons({ seed, keys, name }, { copyText: seed, copyLabel: 'Копировать фразу' }),
+            el('p', { class: 'tiny muted' }, '«Скачать файлом» — файл с фразой и 21 ключом в «Документы» или «Загрузки». «Сохранить» — на диск, в Telegram или почту. «Копировать фразу» — в буфер обмена.'),
+            keysList(keys),
+            WARN(true),
+            el('label', { class: 'check-row' }, agree, el('span', {}, 'Я сохранил(а) сид-фразу — без неё доступ к счетам не восстановить')),
+            err, next,
+            el('button', { class: 'btn block', type: 'button', onclick: start }, 'Назад'));
+    }
+
+    function own() {
+        step(
+            el('p', { class: 'muted small' }, 'Подключите свою сид-фразу Erachain: её 21 счёт будет обслуживаться банком, а входить вы будете этой фразой.'),
+            form([
+                field('Сид-фраза', seedInput()),
+                field('Ваше имя или организация', input('name', { maxlength: 120, placeholder: 'Необязательно' })),
+            ], 'Зарегистрироваться и войти', async (d) => register(d.seed, d.name.trim())),
+            el('button', { class: 'btn block', type: 'button', onclick: start }, 'Назад'));
+    }
+
+    start();
+    return box;
 }

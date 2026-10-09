@@ -42,8 +42,11 @@ export default {
     title: 'Сервисы',
     async render() {
         // кабинет по ключу счёта: только разделы, работающие с одним счётом
-        const cabinet = state.me && state.me.user.role === 'account';
-        const items = ITEMS.filter((i) => (!i[4] || can(i[4])) && (!cabinet || CABINET.has(i[0])));
+        const role = state.me && state.me.user.role;
+        const cabinet = role === 'account' || role === 'client';
+        // ключи: у владельца и у клиента, вошедшего фразой
+        const allowed = (i) => (i[4] === 'wallet' ? can('wallet') || (role === 'client' && state.me.keys > 0) : !i[4] || can(i[4]));
+        const items = ITEMS.filter((i) => allowed(i) && (!cabinet || CABINET.has(i[0]) || i[0] === '#/keys'));
         return el('div', { class: 'menu-grid' }, items.map(([href, title, sub, d]) => el('a', { class: 'menu-tile', href },
             icon(d), el('b', {}, title), el('span', { class: 'muted' }, sub))));
     },

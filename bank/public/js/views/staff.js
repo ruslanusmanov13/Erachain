@@ -102,7 +102,7 @@ async function auditView() {
 }
 
 const ACTIONS = [
-    [/^POST \/api\/login$/, 'Вход'], [/^POST \/api\/setup\/create$/, 'Создание кошелька банка'],
+    [/^POST \/api\/login$/, 'Вход'], [/^POST \/api\/register$/, 'Регистрация клиента'], [/^PATCH \/api\/clients\//, 'Доступ клиента'], [/^POST \/api\/setup\/create$/, 'Создание кошелька банка'],
     [/^POST \/api\/security\/seed\/show$/, 'Просмотр сид-фразы'], [/^POST \/api\/security\/seed\/bind$/, 'Включён вход по сид-фразе'],
     [/^POST \/api\/security\/seed\/unbind$/, 'Отключён вход по сид-фразе'], [/^POST \/api\/logout$/, 'Выход'], [/^POST \/api\/transfer$/, 'Перевод'],
     [/^POST \/api\/transfer\/batch$/, 'Массовая выплата'], [/^POST \/api\/accounts$/, 'Новый счёт'], [/^POST \/api\/assets$/, 'Выпуск актива'],
@@ -122,8 +122,30 @@ const FIELD_NAMES = {
 };
 const describe = (a) => (ACTIONS.find(([re]) => re.test(a.action)) || [null, a.action])[1];
 
+async function clientsView() {
+    const list = await get('clients');
+    if (!list.length) return card(empty('Клиенты ещё не регистрировались. Регистрация — на экране входа, вкладка «Регистрация».'));
+    const box = el('div', { class: 'stack' });
+    box.append(card(el('p', { class: 'small muted' }, `Клиентов: ${list.length}. У каждого своя сид-фраза и 21 счёт; банк хранит только зашифрованный доступ, фраз и ключей у банка нет.`),
+        el('div', { class: 'list' }, list.map((c) => {
+            const b = el('button', { class: 'btn small ' + (c.disabled ? 'soft' : 'danger'), type: 'button' }, c.disabled ? 'Возобновить' : 'Приостановить');
+            b.addEventListener('click', async () => {
+                if (!c.disabled && !(await confirm(`Приостановить доступ клиента ${c.name || c.hint}? Его сессии закроются сразу.`))) return;
+                await api('PATCH', 'clients/' + c.id, { disabled: !c.disabled });
+                box.replaceWith(await clientsView());
+            });
+            return el('div', { class: 'list-item' },
+                el('div', { class: 'grow' },
+                    el('div', { class: 'title' }, c.name || 'Без имени', ' ', c.disabled ? badge('приостановлен', 'bad') : null),
+                    el('div', { class: 'sub mono small' }, c.address),
+                    el('div', { class: 'tiny muted' }, `с ${date(c.createdAt)} · фраза ${c.hint} · ${c.accounts} ${c.accounts % 10 === 1 && c.accounts % 100 !== 11 ? 'счёт' : 'счетов'}`)),
+                b);
+        }))));
+    return box;
+}
+
 async function render(params) {
-    const views = { staff: staffList, shift: shiftView, audit: auditView };
+    const views = { staff: staffList, shift: shiftView, audit: auditView, clients: clientsView };
     const mode = views[params[0]] ? params[0] : 'staff';
     const body = el('div', {}, spinner());
     const show = async (k) => {
@@ -135,7 +157,7 @@ async function render(params) {
         }
     };
     show(mode);
-    return el('div', {}, tabs([['staff', 'Сотрудники'], ['shift', 'Смена'], ['audit', 'Журнал']], mode, show), body);
+    return el('div', {}, tabs([['staff', 'Сотрудники'], ['clients', 'Клиенты'], ['shift', 'Смена'], ['audit', 'Журнал']], mode, show), body);
 }
 
 export default { title: 'Сотрудники', render };

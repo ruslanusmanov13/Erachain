@@ -792,9 +792,10 @@ public class AddressesResource {
     }
 
     public String importAccount(String accountSeed, int baseLen) {
-        // CHECK IF CONTENT IS EMPTY
-        String password = null;
+        return importAccount(accountSeed, baseLen, null);
+    }
 
+    public String importAccount(String accountSeed, int baseLen, String password) {
         APIUtils.askAPICallAllowed(password, "GET addresses import Account", request, true);
 
         // CHECK IF WALLET EXISTS
@@ -837,8 +838,9 @@ public class AddressesResource {
      */
     @POST
     @Path("importaccountseed")
-    public String importAccountSeed(String accountSeed) {
-        return importAccount(accountSeed, Crypto.HASH_LENGTH);
+    public String importAccountSeed(String accountSeed, @QueryParam("password") String password) {
+        // password — для ноды без GUI (иначе запрос пароля невозможен)
+        return importAccount(accountSeed.trim(), Crypto.HASH_LENGTH, password);
     }
 
     /**

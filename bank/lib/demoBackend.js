@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 const { BankError } = require('./validate');
-const { deriveAccounts } = require('./erakeys');
+const { deriveAccounts, fromPrivateKey } = require('./erakeys');
 const { sameSeed, normalizeSeed } = require('./seed');
 
 const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -162,6 +162,14 @@ class DemoBackend {
             deriveAccounts(seed).forEach((x, i) => this.addAccount(i === 0 ? { 1: '100', 2: '1' } : {}, x.address));
         }
         return true;
+    }
+
+    async importKey(privateKey, password) {
+        this.check(password);
+        const { address } = fromPrivateKey(privateKey);
+        if (this.accountsMap.has(address)) return null;
+        this.addAccount({}, address);
+        return address;
     }
 
     async walletAddresses(password) {
