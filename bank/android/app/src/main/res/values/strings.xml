@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Банк Erachain</string>
+    <string name="title_activity_main">Банк Erachain</string>
+    <string name="package_name">org.erachain.bank</string>
+    <string name="custom_url_scheme">org.erachain.bank</string>
+</resources>
