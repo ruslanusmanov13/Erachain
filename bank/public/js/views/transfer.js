@@ -1,4 +1,4 @@
-import { post } from '../api.js';
+import { get, post } from '../api.js';
 import { el, card, field, input, form, tabs, fmt, short, toast, openDialog, closeDialog, kv } from '../ui.js';
 import { state, loadAccounts, currentAccount, accountSelect, assetSelect, assetName, setCurrent } from '../state.js';
 import { isWalletRole, sendSigned } from '../wallet/session.js';
@@ -18,9 +18,31 @@ function singleForm() {
         setCurrent(addr);
         assetSel.replaceWith(assetSelect('asset', currentAccount(), assetSel.value));
     });
+    // проверка получателя: контрольная сумма, нода, был ли адрес в сети
+    const toInput = input('to', { placeholder: 'Адрес Erachain (начинается с 7)', required: true, spellcheck: 'false' });
+    const toHint = el('span', { class: 'tiny' });
+    let checkSeq = 0;
+    toInput.addEventListener('change', async () => {
+        const a = toInput.value.trim();
+        const seq = ++checkSeq;
+        toHint.textContent = '';
+        if (!a) return;
+        try {
+            const r = await get(`address/${encodeURIComponent(a)}/check`);
+            if (seq !== checkSeq) return;
+            toHint.className = 'tiny ' + (!r.valid ? 'out' : r.note ? 'warn-text' : 'in');
+            toHint.textContent = !r.valid ? '✕ ' + (r.reason || r.note || 'Неверный адрес')
+                : r.own ? '✓ Счёт банка' + (r.client ? ` (клиент ${r.client})` : '') : r.note ? '⚠ ' + r.note : '✓ Адрес верный, уже работал в сети';
+        } catch (e) {
+            if (seq === checkSeq) {
+                toHint.className = 'tiny out';
+                toHint.textContent = '✕ ' + e.message;
+            }
+        }
+    });
     return form([
         field('Со счёта', accSel),
-        field('Получатель', input('to', { placeholder: 'Адрес Erachain (начинается с 7)', required: true, spellcheck: 'false' })),
+        el('label', {}, 'Получатель', toInput, toHint),
         el('div', { class: 'grid-2' },
             field('Сумма', input('amount', { inputmode: 'decimal', placeholder: '0.00', required: true })),
             field('Актив', assetSel)),

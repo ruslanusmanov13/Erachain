@@ -105,7 +105,7 @@ class SevenPayDemo {
             ERA: { id: 9, name: 'ERA', name2: 'erachain', system: 'erachain', token_key: 1 },
             COMPU: { id: 10, name: 'COMPU', name2: 'erachain', system: 'erachain', token_key: 2 },
         };
-        this.exchangeAccount = '7' + crypto.randomBytes(24).toString('hex').replace(/[0OIl]/g, 'x').slice(0, 33);
+        this.exchangeAccount = require('./erakeys').addressOf(crypto.randomBytes(32));
         this.payments = []; // { currOut, address, amount_in, curr_in, done, created }
         this.fee = 0.005; // 0,5 % комиссия обменника
     }

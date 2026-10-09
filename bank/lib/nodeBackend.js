@@ -9,14 +9,68 @@ const { ACCOUNTS } = require('./erakeys');
  * (нода разблокирует кошелёк только на время вызова).
  */
 class NodeBackend {
-    constructor(rpcUrl, { timeoutMs = 20000 } = {}) {
-        this.rpcUrl = rpcUrl.replace(/\/+$/, '');
+    /**
+     * rpcUrl — адрес ноды или несколько через запятую. Первая — основная: на ней кошелёк банка, все
+     * подписывающие вызовы идут только на неё. Чтение и отправка уже подписанных транзакций при сбое
+     * основной переходят на запасные ноды; к основной банк возвращается сам, как только она отвечает.
+     */
+    constructor(rpcUrl, { timeoutMs = 20000, retryPrimaryMs = 60000 } = {}) {
+        this.nodes = String(rpcUrl).split(',').map((u) => u.trim().replace(/\/+$/, '')).filter(Boolean)
+            .map((url, i) => ({ url, primary: i === 0, fails: 0, lastError: null, lastOk: null, downSince: null }));
+        if (!this.nodes.length) throw new Error('Не задан адрес RPC ноды');
+        this.rpcUrl = this.nodes[0].url;
         this.timeoutMs = timeoutMs;
+        this.retryPrimaryMs = retryPrimaryMs;
+        this.active = 0;
         this.assetCache = new Map();
     }
 
+    // вызов требует кошелька основной ноды: передан пароль или это управление кошельком/ключами
+    walletBound(path, query, body) {
+        if ((query && query.password) || (body && body.password)) return true;
+        return /^(wallet|addresses(\/(importaccountseed|seed|new))?$|addresses\?)/.test(path) || path === 'addresses';
+    }
+
+    order(bound) {
+        if (bound || this.nodes.length === 1) return [this.nodes[0]];
+        const primary = this.nodes[0];
+        // основная упала недавно — сначала запасные, но раз в retryPrimaryMs пробуем вернуться
+        if (primary.downSince && Date.now() - primary.downSince < this.retryPrimaryMs) {
+            const rest = this.nodes.slice(1);
+            const start = Math.max(0, this.active - 1) % rest.length;
+            return [...rest.slice(start), ...rest.slice(0, start), primary];
+        }
+        return this.nodes;
+    }
+
     async call(path, { query = {}, body, raw: rawBody } = {}) {
-        const url = new URL(this.rpcUrl + '/' + path);
+        const bound = this.walletBound(path, query, body);
+        let lastErr = null;
+        for (const node of this.order(bound)) {
+            try {
+                const data = await this.callNode(node, path, { query, body, raw: rawBody });
+                node.fails = 0;
+                node.lastOk = Date.now();
+                node.downSince = null;
+                this.active = this.nodes.indexOf(node);
+                return data;
+            } catch (e) {
+                if (e.status !== 502) {
+                    // ответ ноды (ошибка операции) — не сбой связи; помечаем, какая нода ответила
+                    e.fromPrimary = node.primary;
+                    throw e;
+                }
+                node.fails += 1;
+                node.lastError = e.message;
+                node.downSince = node.downSince || Date.now();
+                lastErr = e;
+            }
+        }
+        throw lastErr;
+    }
+
+    async callNode(node, path, { query, body, raw: rawBody }) {
+        const url = new URL(node.url + '/' + path);
         for (const [k, v] of Object.entries(query)) {
             if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
         }
@@ -30,7 +84,7 @@ class NodeBackend {
                 signal: AbortSignal.timeout(this.timeoutMs),
             });
         } catch (e) {
-            throw new BankError('Нода Erachain недоступна: ' + this.rpcUrl, 502);
+            throw new BankError('Нода Erachain недоступна: ' + node.url, 502);
         }
         const raw = await res.text();
         let data;
@@ -51,6 +105,27 @@ class NodeBackend {
         return data;
     }
 
+    // проверка адреса на ноде (формат и контрольная сумма по правилам сети)
+    async validateAddress(address) {
+        const r = await this.call('addresses/validate/' + address);
+        return r === true || String(r) === 'true';
+    }
+
+    // состояние нод для раздела «Сеть»: высота каждой, отставание, ошибки
+    async nodesInfo() {
+        const out = await Promise.all(this.nodes.map(async (n) => {
+            try {
+                const h = Number(await this.callNode(n, 'blocks/height', { query: {} }));
+                n.lastOk = Date.now();
+                return { url: n.url, primary: n.primary, ok: true, height: h };
+            } catch (e) {
+                return { url: n.url, primary: n.primary, ok: false, error: e.message };
+            }
+        }));
+        const top = Math.max(0, ...out.filter((x) => x.ok).map((x) => x.height));
+        return out.map((x) => ({ ...x, behind: x.ok ? top - x.height : null, active: this.nodes[this.active].url === x.url }));
+    }
+
     // ---------- Сеть ----------
 
     async status() {
@@ -58,16 +133,17 @@ class NodeBackend {
             this.call('blocks/height'),
             this.call('core/version').catch(() => ({})),
         ]);
-        return { mode: 'node', node: this.rpcUrl, height: Number(height), version: version.version || '' };
+        return { mode: 'node', node: this.nodes[this.active].url, fallback: this.active !== 0, height: Number(height), version: version.version || '' };
     }
 
     async network() {
-        const [height, version, status, peers, last] = await Promise.all([
+        const [height, version, status, peers, last, nodes] = await Promise.all([
             this.call('blocks/height'),
             this.call('core/version').catch(() => ({})),
             this.call('core/status').catch(() => null),
             this.call('peers').catch(() => []),
             this.call('blocks/last').catch(() => null),
+            this.nodes.length > 1 ? this.nodesInfo() : null,
         ]);
         const states = { 0: 'нет соединений', 1: 'синхронизация', 2: 'синхронизирована' };
         return {
@@ -78,6 +154,7 @@ class NodeBackend {
             buildDate: version.buildDate || '',
             state: states[status] || String(status ?? '—'),
             peers: Array.isArray(peers) ? peers.length : 0,
+            nodes, // основная и запасные ноды банка: высота, отставание, какая сейчас отвечает
             lastBlock: last ? {
                 height: last.height,
                 creator: last.creator,
@@ -253,7 +330,12 @@ class NodeBackend {
                 from: tx.creator, to: tx.recipient, asset: tx.asset ?? tx.assetKey ?? null, amount: tx.amount ?? null,
             };
         } catch (e) {
-            if (e.code === 24) return { found: false };
+            if (e.code === 24) {
+                // «не найдена» от запасной ноды не доказывает, что транзакции нет (нода может отставать):
+                // по такому ответу перевод заново формировать нельзя — считаем состояние неизвестным
+                if (e.fromPrimary === false) throw new BankError('Основная нода недоступна, запасная не видит транзакцию — ждём', 502);
+                return { found: false };
+            }
             throw e;
         }
     }

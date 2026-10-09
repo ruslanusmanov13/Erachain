@@ -15,8 +15,36 @@ class BankError extends Error {
     }
 }
 
+// контрольная сумма адреса: Base58(15 | 20 байт | 4 байта SHA256(SHA256(первые 21 байт)))
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function addressBytes(s) {
+    let n = 0n;
+    for (const ch of s) {
+        const i = B58.indexOf(ch);
+        if (i < 0) return null;
+        n = n * 58n + BigInt(i);
+    }
+    const hex = n.toString(16).padStart(50, '0');
+    return hex.length === 50 ? Buffer.from(hex, 'hex') : null;
+}
+
+function checksumOk(value) {
+    const b = addressBytes(value);
+    if (!b || b[0] !== 15) return false;
+    const sha = (x) => require('crypto').createHash('sha256').update(x).digest();
+    return sha(sha(b.subarray(0, 21))).subarray(0, 4).equals(b.subarray(21));
+}
+
+const addressCache = new Map();
 function isAddress(value) {
-    return typeof value === 'string' && ADDRESS_RE.test(value);
+    if (typeof value !== 'string' || !ADDRESS_RE.test(value)) return false;
+    let ok = addressCache.get(value);
+    if (ok === undefined) {
+        ok = checksumOk(value); // опечатка в адресе меняет контрольную сумму — такой адрес не пройдёт
+        if (addressCache.size > 50000) addressCache.clear();
+        addressCache.set(value, ok);
+    }
+    return ok;
 }
 
 function isAmount(value) {
@@ -213,7 +241,7 @@ function validatePersonIssue(body) {
 }
 
 module.exports = {
-    BankError, isAddress, isAmount, isAssetKey, amountOf, text,
+    BankError, isAddress, checksumOk, isAmount, isAssetKey, amountOf, text,
     validateTransfer, validateMultiTransfer, validateAssetIssue, validatePoll, validateVote,
     validateOrder, validateCancel, validateMessage, validateDocument, validateCertify, validatePersonIssue,
 };

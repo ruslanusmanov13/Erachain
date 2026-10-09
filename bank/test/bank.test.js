@@ -13,8 +13,9 @@ const formats = require('../lib/bank/formats');
 const v = require('../lib/validate');
 const { SevenPayClient, SevenPayDemo } = require('../lib/sevenpay');
 
-const A = '7' + 'A'.repeat(33);
-const B = '7' + 'B'.repeat(33);
+// правильные адреса (с контрольной суммой) для тестов
+const A = require('../lib/erakeys').addressOf(Buffer.alloc(32, 1));
+const B = require('../lib/erakeys').addressOf(Buffer.alloc(32, 2));
 const PHOTO = Buffer.alloc(12 * 1024, 7).toString('base64');
 
 function listen(server) {
@@ -1502,4 +1503,63 @@ test('залоговое кредитование (Vires): депозит, за�
     assert.ok(got > 100000 && got < 100000 * (1 + rub.borrowApr), String(got));
     // доля банка (резерв) осталась в пуле
     assert.ok(await bal(pool, 1048) > 0);
+});
+
+test('надёжность: запасная нода, подпись только на основной, «не найдена» от запасной не доверяется', async (t) => {
+    const hits = [];
+    const fallback = http.createServer((req, res) => {
+        hits.push(req.url);
+        res.setHeader('Content-Type', 'application/json');
+        if (req.url.startsWith('/blocks/height')) return res.end('1234');
+        if (req.url.startsWith('/record/broadcast')) return res.end('"+"');
+        if (req.url.startsWith('/transactions/signature/')) return res.end(JSON.stringify({ error: 24, message: 'not exists' }));
+        res.end('{}');
+    });
+    const fb = await listen(fallback);
+    t.after(() => fallback.close());
+    // основная — закрытый порт
+    const dead = http.createServer();
+    const deadUrl = await listen(dead);
+    await new Promise((r) => dead.close(r));
+    const n = new NodeBackend(`${deadUrl},${fb}`, { timeoutMs: 2000 });
+    assert.strictEqual((await n.status()).height, 1234, 'чтение — с запасной');
+    assert.strictEqual((await n.status()).fallback, true);
+    assert.strictEqual(await n.broadcast('abc'), true, 'подписанная транзакция уходит через запасную');
+    await assert.rejects(n.makeTransfer({ from: A, to: B, asset: 1, amount: '1' }, 'pass'), (e) => e.status === 502, 'подпись — только основная нода');
+    assert.ok(!hits.some((u) => u.includes('password')), 'пароль кошелька на запасную ноду не уходит');
+    await assert.rejects(n.txStatus('sig'), (e) => e.status === 502, '«не найдена» от запасной — неизвестно');
+    const info = await n.nodesInfo();
+    assert.deepStrictEqual(info.map((x) => [x.primary, x.ok]), [[true, false], [false, true]]);
+});
+
+test('надёжность: контрольная сумма адреса, проверка адреса, журнал платежей', async (t) => {
+    const keys = require('../lib/erakeys');
+    const good = keys.addressOf(Buffer.alloc(32, 9));
+    const typo = good.slice(0, 10) + (good[10] === 'a' ? 'b' : 'a') + good.slice(11);
+    assert.deepStrictEqual([v.isAddress(good), v.isAddress(typo)], [true, false]);
+
+    const { call, accounts, backend } = await startDemo(t);
+    const me = accounts[0].address;
+    let r = await call('POST', '/api/transfer', { from: me, to: typo, asset: 1, amount: '1' });
+    assert.strictEqual(r.status, 400, 'адрес с опечаткой не принимается');
+    r = await call('GET', `/api/address/${typo}/check`);
+    assert.deepStrictEqual([r.data.valid, /контрольная сумма/.test(r.data.reason)], [false, true]);
+    r = await call('GET', `/api/address/${good}/check`);
+    assert.deepStrictEqual([r.data.valid, r.data.known, r.data.own], [true, false, false]);
+    assert.match(r.data.note, /ещё не было/);
+    assert.strictEqual((await call('GET', `/api/address/${accounts[1].address}/check`)).data.own, true);
+
+    // журнал: кто, откуда, куда, подпись; неудачный перевод — тоже; подтверждение сетью
+    await call('POST', '/api/transfer', { from: me, to: good, asset: 1, amount: '2.5', title: 'Тест журнала' });
+    await call('POST', '/api/transfer', { from: me, to: good, asset: 1, amount: '999999' });
+    let list = (await call('GET', '/api/payments')).data;
+    assert.deepStrictEqual(list.slice(0, 2).map((x) => [x.status, x.amount, x.by, x.source]),
+        [['failed', '999999', 'owner', 'POST /api/transfer'], ['sent', '2.5', 'owner', 'POST /api/transfer']]);
+    backend.height += 1;
+    await call('POST', '/api/payments/check');
+    list = (await call('GET', `/api/payments?address=${good}&status=confirmed`)).data;
+    assert.strictEqual(list.length, 1);
+    assert.ok(list[0].signature);
+    const csv = await call('GET', '/api/payments?format=csv');
+    assert.match(csv.data.toString('utf8'), /Тест журнала/);
 });

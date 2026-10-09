@@ -18,6 +18,7 @@ const { Merchants } = require('./lib/merchants');
 const { MarketMaker } = require('./lib/marketmaker');
 const { Anchors, canonical } = require('./lib/anchors');
 const { Lending } = require('./lib/lending');
+const { PaymentsLog } = require('./lib/paylog');
 const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Decode, base58Encode } = require('./lib/seed');
 const { deriveAccounts } = require('./lib/erakeys');
 const { Clients } = require('./lib/clients');
@@ -50,6 +51,9 @@ function createApp(backend, options = {}) {
     const sessions = new Map(); // token -> { password, user, expires }; пароль только в памяти сервера
     const failures = new Map(); // ip -> { count, until } — защита от подбора пароля
     const store = options.store || new JsonStore(null, {});
+    // журнал платежей: все исходящие переводы банка проходят через обёртку бэкенда
+    const paylog = new PaymentsLog(store);
+    backend = paylog.wrap(backend);
     const gateway = new Gateway(backend, store);
     const staff = new Staff(store);
     const invoices = new Invoices(backend, store);
@@ -135,6 +139,7 @@ function createApp(backend, options = {}) {
     if (options.jobsIntervalMs !== 0) {
         const timer = setInterval(async () => {
             try {
+                await paylog.tick(backend);
                 await invoices.tick();
                 if (staff.shift && store.data.invoicesIssued.some((i) => !['paid'].includes(i.status))) {
                     await invoices.checkIssued(staff.walletPassword({ password: null }));
@@ -240,6 +245,8 @@ function createApp(backend, options = {}) {
             if (pathname === '/api/invoices/cleanup') return ['settings'];
             return pathname === '/api/invoices/settings' ? ['settings'] : ['sign'];
         }
+        if (pathname.startsWith('/api/payments')) return ['statements'];
+        if (pathname.startsWith('/api/address/')) return ['read'];
         if (pathname.startsWith('/api/lending')) {
             if (method === 'GET') return ['read'];
             if (pathname === '/api/lending/settings' || pathname === '/api/lending/pools') return ['settings'];
@@ -360,7 +367,7 @@ function createApp(backend, options = {}) {
         ['/api/documents', 'creator'], ['/api/documents/vouch', 'creator'],
         ['/api/persons', 'creator'], ['/api/persons/certify', 'creator'], ['/api/invoices/pay', 'from'],
     ];
-    const CABINET_GET = /^\/api\/(me|network|accounts|assets(\/\d+|\/types)?|polls(\/\d+)?|persons(\/\d+)?|catalog\/(statuses|templates)|exchange\/\d+\/\d+|documents\/verify\/\w+)$/;
+    const CABINET_GET = /^\/api\/(me|network|address\/[1-9A-HJ-NP-Za-km-z]{20,40}\/check|accounts|assets(\/\d+|\/types)?|polls(\/\d+)?|persons(\/\d+)?|catalog\/(statuses|templates)|exchange\/\d+\/\d+|documents\/verify\/\w+)$/;
     const CABINET_GET_OWN = /^\/api\/(?:accounts\/([^/]+)\/history|exchange\/orders\/([^/]+)|messages\/([^/]+))$/;
 
     // клиент и кабинет по ключу: только свои счета (scope)
@@ -876,6 +883,37 @@ function createApp(backend, options = {}) {
         ['POST', '/api/invoices/cleanup', async ({ req, session }) => invoices.cleanup(session.password, await readJson(req))],
         ['GET', '/api/invoices/paid', () => invoices.paidList()],
 
+        // журнал платежей и проверка адреса
+        ['GET', '/api/payments', ({ url }) => {
+            const q = url.searchParams;
+            const from = q.get('from') ? Date.parse(q.get('from')) : 0;
+            const to = q.get('to') ? Date.parse(q.get('to')) + 86400000 - 1 : Infinity;
+            const list = paylog.list({ from, to, status: q.get('status') || null, address: q.get('address') || null, limit: Number(q.get('limit')) || 500 });
+            if (q.get('format') === 'csv') return file(`payments-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv; charset=utf-8', paylog.csv(list));
+            return list;
+        }],
+        ['POST', '/api/payments/check', async () => {
+            await paylog.tick(backend, 200);
+            return { ok: true };
+        }],
+        ['GET', /^\/api\/address\/([1-9A-HJ-NP-Za-km-z]{20,40})\/check$/, async ({ m, session }) => {
+            const address = m[1];
+            const local = v.checksumOk(address) && /^7/.test(address);
+            if (!local) return { address, valid: false, reason: 'Ошибка в адресе: не сходится контрольная сумма (опечатка?)' };
+            const [node, pub, wallet] = await Promise.all([
+                backend.validateAddress ? backend.validateAddress(address).catch(() => null) : null,
+                backend.publicKey(address).catch(() => null),
+                session.password ? backend.walletAddresses(session.password).catch(() => []) : [],
+            ]);
+            const client = store.data.clients.find((c) => clients.addresses(c).includes(address));
+            // клиенту — без сведений о счетах банка и других клиентах
+            if (session.scope) return { address, valid: node !== false, known: !!pub, note: node === false ? 'Нода считает адрес неверным' : !pub ? 'По этому адресу ещё не было исходящих операций — проверьте, что он верный' : null };
+            return {
+                address, valid: node !== false, node, known: !!pub, own: wallet.includes(address), client: client ? client.name || client.hint : null,
+                note: node === false ? 'Нода считает адрес неверным' : !pub ? 'По этому адресу ещё не было исходящих операций — проверьте, что он верный' : null,
+            };
+        }],
+
         // залоговое кредитование
         ['GET', '/api/lending', () => lending.overview()],
         ['PUT', '/api/lending/settings', async ({ req }) => lending.updateSettings(await readJson(req))],
@@ -1045,7 +1083,8 @@ function createApp(backend, options = {}) {
             session = r.opts.public ? null : requireSession(req);
             if (session && session.scope) await checkCabinet(req, url, session);
             if (session) for (const perm of permsFor(req.method, url.pathname)) Staff.require(session.user, perm);
-            body = await r.handler({ req, url, m: r.m, session, ip });
+            const who = session ? session.user.login || session.user.name : 'без входа';
+            body = await paylog.run({ by: who, source: `${req.method} ${url.pathname}` }, () => r.handler({ req, url, m: r.m, session, ip }));
         } catch (e) {
             status = e instanceof BankError ? e.status : 500;
             body = { error: e instanceof BankError ? e.message : 'Внутренняя ошибка сервера' };

@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { BankError } = require('./validate');
+const { BankError, isAddress } = require('./validate');
 const { deriveAccounts, fromPrivateKey } = require('./erakeys');
 const { parseRaw, verifyTx } = require('./eratx');
 const DEMO_NETWORK_PORT = 9066; // демо подписывается как тестовая сеть
@@ -21,10 +21,9 @@ function base58(bytes) {
     return s;
 }
 
+// случайный, но правильный адрес Erachain (с контрольной суммой)
 function randomAddress() {
-    let s = '7';
-    for (const b of crypto.randomBytes(33)) s += ALPHABET[b % ALPHABET.length];
-    return s;
+    return require('./erakeys').addressOf(crypto.randomBytes(32));
 }
 
 function toUnits(amount) {
@@ -176,6 +175,10 @@ class DemoBackend {
         if (this.accountsMap.has(address)) return null;
         this.addAccount({}, address);
         return address;
+    }
+
+    async validateAddress(address) {
+        return isAddress(address);
     }
 
     // остатки любого счёта (в т.ч. кошелька на устройстве)
