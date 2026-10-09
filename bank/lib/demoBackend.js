@@ -3,7 +3,9 @@
 const crypto = require('crypto');
 const { BankError } = require('./validate');
 const { deriveAccounts, fromPrivateKey } = require('./erakeys');
-const { sameSeed, normalizeSeed } = require('./seed');
+const { parseRaw, verifyTx } = require('./eratx');
+const DEMO_NETWORK_PORT = 9066; // демо подписывается как тестовая сеть
+const { sameSeed, normalizeSeed, base58Decode } = require('./seed');
 
 const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const FEE = '0.00010000'; // условная комиссия сети в COMPU
@@ -48,7 +50,11 @@ class DemoBackend {
         // счета демо-банка — 21 счёт сид-фразы, как у настоящей ноды
         this.worldSeed = seed || base58(crypto.randomBytes(32));
         this.seed = fresh ? null : this.worldSeed;
-        const own = deriveAccounts(this.worldSeed).map((x) => x.address);
+        const derived = deriveAccounts(this.worldSeed);
+        const own = derived.map((x) => x.address);
+        this.publicKeys = new Map(derived.map((x) => [x.address, base58Decode(x.publicKey)]));
+        this.external = new Map(); // счета кошельков на устройствах: не в кошельке ноды
+        this.networkPort = DEMO_NETWORK_PORT;
         this.height = 1500000;
         this.accountsMap = new Map(); // address -> Map(assetKey -> units)
         this.txs = [];
@@ -172,6 +178,44 @@ class DemoBackend {
         return address;
     }
 
+    // остатки любого счёта (в т.ч. кошелька на устройстве)
+    async balances(address) {
+        const map = this.accountsMap.get(address) || this.external.get(address) || new Map();
+        return [...map.entries()].sort((x, y) => x[0] - y[0]).map(([asset, units]) => ({
+            asset, name: this.assetName(asset), amount: fromUnits(units), debt: fromUnits(this.debtOf(address, asset)), hold: '0', spend: '0',
+        }));
+    }
+
+    // демо: новому кошельку на устройстве — стартовые ERA и COMPU на первый счёт, чтобы было что переводить
+    demoWallet(addresses, publicKeys = []) {
+        addresses.forEach((a, i) => {
+            if (publicKeys[i]) this.publicKeys.set(a, publicKeys[i]);
+            if (!this.accountsMap.has(a) && !this.external.has(a)) {
+                const m = new Map();
+                if (i === 0) {
+                    m.set(1, toUnits('100'));
+                    m.set(2, toUnits('1'));
+                }
+                this.external.set(a, m);
+            }
+        });
+    }
+
+    async publicKey(address) {
+        const k = this.publicKeys.get(address);
+        return k ? base58(k) : null;
+    }
+
+    async txData(signature) {
+        const t = this.txs.find((x) => x.signature === signature) || this.telegrams.find((x) => x.signature === signature);
+        if (!t) throw new BankError('Нода: Transaction does not exist');
+        const pub = t.creatorPublicKey || this.publicKeys.get(t.from);
+        return {
+            signature, from: t.from, to: t.to, creatorPublicKey: pub ? base58(pub) : null, encrypted: !!t.encrypted,
+            data: t.encrypted ? t.dataB64 || null : null, message: t.encrypted ? null : t.message ?? null, title: t.title || '',
+        };
+    }
+
     async walletAddresses(password) {
         this.check(password);
         return [...this.accountsMap.keys()];
@@ -275,7 +319,7 @@ class DemoBackend {
     }
 
     async history(address, limit = 50) {
-        this.own(address);
+        if (!this.external.has(address)) this.own(address);
         return this.txs
             .filter((t) => t.from === address || t.to === address)
             .slice(0, limit)
@@ -284,7 +328,7 @@ class DemoBackend {
                 from: t.from, to: t.to || null, asset: t.asset ?? null,
                 assetName: t.asset ? this.assetName(t.asset) : null, amount: t.amount ? fromUnits(toUnits(t.amount)) : null,
                 direction: t.to === address && t.from !== address ? 'in' : 'out',
-                title: t.title, message: t.message, fee: t.fee, confirmations: this.confirmations(t),
+                title: t.title, message: t.message, encrypted: !!t.encrypted, fee: t.fee, confirmations: this.confirmations(t),
             }));
     }
 
@@ -309,7 +353,8 @@ class DemoBackend {
 
     async broadcast(raw) {
         const p = this.pendingRaw && this.pendingRaw.get(raw);
-        if (!p || p.sent) {
+        if (!p) return this.broadcastSigned(raw);
+        if (p.sent) {
             const err = new BankError('Нода: Invalid timestamp');
             err.code = 7;
             throw err;
@@ -324,6 +369,46 @@ class DemoBackend {
         p.sent = true;
         const tx = this.record('transfer', { typeName: 'Перевод', from: t.from, to: t.to, asset: Number(t.asset), amount: t.amount, title: t.title, message: t.message });
         tx.signature = raw;
+        return true;
+    }
+
+    // транзакция, подписанная на устройстве: проверка подписи, повторов и средств — как у ноды
+    broadcastSigned(raw) {
+        const err = (msg, code) => Object.assign(new BankError('Нода: ' + msg), { code });
+        let tx;
+        try {
+            tx = parseRaw(raw);
+        } catch (e) {
+            throw err('Invalid raw data', 1);
+        }
+        if (tx.type !== 31) throw err('Демо принимает с устройства только переводы и письма', 1);
+        if (!verifyTx(tx, DEMO_NETWORK_PORT)) throw err('Invalid signature', 3);
+        if (this.txs.some((x) => x.signature === tx.signatureB58)) throw err('Invalid timestamp (already exists)', 7);
+        const last = this.lastTs && this.lastTs.get(tx.creator);
+        if (last && tx.timestamp <= last) throw err('Invalid timestamp', 7);
+        if (Math.abs(Date.now() - tx.timestamp) > 30 * 60000) throw err('Invalid timestamp', 7);
+        const src = this.accountsMap.get(tx.creator) || this.external.get(tx.creator);
+        const fee = toUnits(FEE);
+        if (!src || (src.get(2) || 0n) < fee) throw err('Not enough fee', 10);
+        if (tx.amount !== undefined) {
+            if (!this.assetsMap.has(tx.asset)) throw err('Asset does not exist', 204);
+            const units = toUnits(tx.amount);
+            if ((src.get(tx.asset) || 0n) < units + (tx.asset === 2 ? fee : 0n)) throw err('No balance', 11);
+            src.set(tx.asset, src.get(tx.asset) - units);
+            const dst = this.accountsMap.get(tx.recipient) || this.external.get(tx.recipient);
+            if (dst) dst.set(tx.asset, (dst.get(tx.asset) || 0n) + units);
+        }
+        src.set(2, src.get(2) - fee);
+        this.publicKeys.set(tx.creator, tx.publicKey);
+        this.lastTs = this.lastTs || new Map();
+        this.lastTs.set(tx.creator, tx.timestamp);
+        const rec = this.record('transfer', {
+            typeName: tx.amount !== undefined ? 'Перевод' : 'Письмо', from: tx.creator, to: tx.recipient, asset: tx.asset ?? null,
+            amount: tx.amount ?? null, title: tx.title, message: tx.data && !tx.encrypted && tx.isText ? tx.data.toString('utf8') : '',
+            encrypted: !!tx.encrypted, dataB64: tx.encrypted ? tx.data.toString('base64') : null,
+        });
+        rec.signature = tx.signatureB58;
+        rec.timestamp = tx.timestamp;
         return true;
     }
 

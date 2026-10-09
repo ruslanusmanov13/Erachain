@@ -14,9 +14,11 @@ const { Staff, ROLES } = require('./lib/staff');
 const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
 const { Invoices } = require('./lib/invoices');
 const { Loans } = require('./lib/loans');
-const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed } = require('./lib/seed');
+const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Decode, base58Encode } = require('./lib/seed');
 const { deriveAccounts } = require('./lib/erakeys');
 const { Clients } = require('./lib/clients');
+const { parseRaw, verifySig } = require('./lib/eratx');
+const { addressOf } = require('./lib/erakeys');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -49,6 +51,9 @@ function createApp(backend, options = {}) {
     const loans = new Loans(backend, store);
     const ownerKey = new OwnerKey(store);
     const clients = new Clients(store);
+    // порт сети для подписи транзакций на устройстве: 9046 — основная, 9066 — тестовая (RPC-порт ноды − 2)
+    const networkPort = options.networkPort || backend.networkPort || 9046;
+    const walletNonces = new Map(); // одноразовые коды входа кошелька на устройстве
     // код первого запуска: без него чужой не создаст кошелёк, если сервер виден из сети раньше владельца
     const setupCode = options.setupCode || null;
     // демо: готовые сотрудники, открытая смена и привязанная сид-фраза, чтобы всё можно было опробовать сразу
@@ -124,6 +129,8 @@ function createApp(backend, options = {}) {
                 throw new BankError('Доступ клиента приостановлен банком', 401);
             }
             s.scope = s.user.role === 'account' ? [s.user.address] : clients.addresses(c);
+        } else if (s.user.role === 'wallet') {
+            s.scope = s.user.addresses;
         } else if (s.user.role === 'account') {
             // кабинет по ключу счёта владельца живёт, пока включён вход по сид-фразе
             if (!ownerKey.hasAccount(s.user.address)) {
@@ -146,8 +153,9 @@ function createApp(backend, options = {}) {
             user: s.user,
             raw: s,
             scope: s.scope || null, // счета клиента или кабинета по ключу; null — счета банка
-            // пароль кошелька для операции: свой у владельца, у сотрудника — открытой смены
-            get password() { return staff.walletPassword(s); },
+            // пароль кошелька для операции: свой у владельца, у сотрудника — открытой смены;
+            // у кошелька на устройстве пароля нет — он подписывает сам, сервер только читает и отправляет
+            get password() { return s.user.role === 'wallet' ? null : staff.walletPassword(s); },
         };
     }
 
@@ -155,6 +163,7 @@ function createApp(backend, options = {}) {
     function permsFor(method, pathname) {
         if (pathname === '/api/logout' || pathname === '/api/me' || pathname === '/api/session/account') return [];
         if (pathname === '/api/keys') return []; // ключи есть только у сессии, вошедшей фразой
+        if (pathname.startsWith('/api/wallet/') || pathname.startsWith('/api/pubkey/') || pathname.startsWith('/api/tx/')) return ['read'];
         if (pathname.startsWith('/api/clients')) return ['staff'];
         if (pathname.startsWith('/api/security')) return ['wallet'];
         if (pathname.startsWith('/api/loans')) {
@@ -265,14 +274,17 @@ function createApp(backend, options = {}) {
         const own = new Set(session.scope);
         const denied = () => new BankError('Здесь доступны только операции ваших счетов', 403);
         const isClient = session.user.role === 'client';
+        const isWallet = session.user.role === 'wallet';
         if (req.method === 'GET') {
-            if (CABINET_GET.test(p) || (isClient && p === '/api/keys')) return;
+            if (CABINET_GET.test(p) || (isClient && p === '/api/keys') || /^\/api\/(pubkey|tx)\/[1-9A-HJ-NP-Za-km-z]+(\/data)?$/.test(p) || p === '/api/wallet/params') return;
             const m = p.match(CABINET_GET_OWN);
             if (m && own.has(decodeURIComponent(m[1] || m[2] || m[3]))) return;
             if (p === '/api/bank/statement' && own.has(url.searchParams.get('address'))) return;
             throw denied();
         }
-        if (p === '/api/logout' || (isClient && p === '/api/session/account')) return;
+        if (p === '/api/logout' || ((isClient || isWallet) && p === '/api/session/account')) return;
+        if (isWallet && p === '/api/wallet/broadcast') return; // отправитель проверяется в обработчике по подписи
+        if (isWallet) throw new BankError('В кошельке на устройстве операции подписываются на телефоне — обновите приложение', 403);
         const rule = CABINET_SIGNER.find(([r]) => (typeof r === 'string' ? r === p : r.test(p)));
         if (!rule || req.method !== 'POST') throw denied();
         const body = await readJson(req);
@@ -413,6 +425,76 @@ function createApp(backend, options = {}) {
             }
             return clientSession(c, walletPassword, prep.keys);
         }, { public: true }],
+
+        // ---------- кошелёк на устройстве: ключи только на телефоне, сервер проверяет подпись и отправляет ----------
+        ['POST', '/api/wallet/challenge', ({ ip }) => {
+            publicLimit(ip);
+            const nonce = crypto.randomBytes(24).toString('hex');
+            walletNonces.set(nonce, Date.now() + 120000);
+            for (const [k, exp] of walletNonces) if (exp < Date.now()) walletNonces.delete(k);
+            return { nonce, message: 'Erachain Bank login ' + nonce, serverTime: Date.now(), port: networkPort };
+        }, { public: true }],
+        ['POST', '/api/wallet/login', async ({ req, ip }) => {
+            checkThrottle(ip);
+            const { publicKeys, nonce, signature } = await readJson(req);
+            const exp = walletNonces.get(String(nonce));
+            walletNonces.delete(String(nonce));
+            if (!exp || exp < Date.now()) throw new BankError('Код входа устарел — попробуйте ещё раз', 401);
+            if (!Array.isArray(publicKeys) || !publicKeys.length || publicKeys.length > 21) throw new BankError('Нужны публичные ключи счетов (1–21)');
+            let keys;
+            try {
+                keys = publicKeys.map((k) => {
+                    const b = base58Decode(String(k));
+                    if (!b || b.length !== 32) throw new Error();
+                    return b;
+                });
+            } catch (e) {
+                throw new BankError('Неверный публичный ключ');
+            }
+            // подпись первым ключом доказывает владение кошельком; ключ на сервер не передаётся
+            const sig = base58Decode(String(signature || ''));
+            if (!sig || sig.length !== 64 || !verifySig(keys[0], Buffer.from('Erachain Bank login ' + nonce, 'utf8'), sig)) {
+                loginFailed(ip);
+                throw new BankError('Подпись не прошла проверку', 401);
+            }
+            failures.delete(ip);
+            const addresses = [...new Set(keys.map((k) => addressOf(k)))];
+            // публичные ключи кошельков известны банку с первого входа — им можно писать зашифрованно,
+            // даже если в сети у счёта ещё нет операций
+            store.data.walletKeys = store.data.walletKeys || {};
+            keys.forEach((k) => { store.data.walletKeys[addressOf(k)] = base58Encode(k); });
+            if (backend.demoWallet) backend.demoWallet(addresses, keys);
+            const w = (store.data.walletUsers = store.data.walletUsers || []);
+            const known = w.find((x) => x.address === addresses[0]);
+            if (known) known.lastAt = Date.now();
+            else w.push({ address: addresses[0], accounts: addresses.length, firstAt: Date.now(), lastAt: Date.now() });
+            store.save();
+            const user = { id: 'wallet:' + addresses[0], login: addresses[0].slice(0, 8), name: 'Кошелёк ' + addresses[0].slice(0, 6) + '…', role: 'wallet', addresses };
+            const token = openSession(null, user);
+            return { token, user, shift: staff.shiftInfo(), port: networkPort };
+        }, { public: true }],
+        ['GET', '/api/wallet/params', () => ({ serverTime: Date.now(), port: networkPort })],
+        ['POST', '/api/wallet/broadcast', async ({ req, session }) => {
+            const { raw } = await readJson(req);
+            const tx = parseRaw(String(raw || ''));
+            if (session.scope && !session.scope.includes(tx.creator)) throw new BankError('Транзакция подписана не вашим счётом', 403);
+            await backend.broadcast(String(raw).trim());
+            return { signature: tx.signatureB58, creator: tx.creator, recipient: tx.recipient || null, amount: tx.amount ?? null, asset: tx.asset ?? null };
+        }],
+        ['GET', /^\/api\/pubkey\/([1-9A-HJ-NP-Za-km-z]{30,40})$/, async ({ m }) => ({
+            address: m[1], publicKey: (await backend.publicKey(m[1])) || (store.data.walletKeys || {})[m[1]] || null,
+        })],
+        ['GET', /^\/api\/tx\/([1-9A-HJ-NP-Za-km-z]{60,100})\/data$/, async ({ m, session }) => {
+            const d = await backend.txData(m[1]);
+            if (session.scope && !session.scope.includes(d.from) && !session.scope.includes(d.to)) throw new BankError('Это не ваша транзакция', 403);
+            return d;
+        }],
+        // расшифровка нодой — для счетов в кошельке ноды (банк, клиенты банка)
+        ['POST', /^\/api\/tx\/([1-9A-HJ-NP-Za-km-z]{60,100})\/decrypt$/, async ({ m, session }) => {
+            const d = await backend.txData(m[1]);
+            if (session.scope && !session.scope.includes(d.from) && !session.scope.includes(d.to)) throw new BankError('Это не ваша транзакция', 403);
+            return { message: await backend.decrypt(m[1], session.password) };
+        }],
 
         ['POST', '/api/login', async ({ req, ip }) => {
             checkThrottle(ip);
@@ -851,6 +933,9 @@ if (require.main === module) {
     const rpc = process.env.ERA_RPC || 'http://127.0.0.1:9048';
     const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
     const backend = demo ? new DemoBackend({ seed: DEMO_SEED, fresh: process.argv.includes('--fresh') }) : new NodeBackend(rpc);
+    // порт сети для подписи на устройстве: явно или по RPC-порту ноды (9048 → 9046, 9068 → 9066)
+    const rpcPort = Number(new URL(rpc).port) || 9048;
+    const networkPort = Number(process.env.ERA_NETWORK_PORT) || (demo ? 9066 : rpcPort - 2);
     const setupCode = demo ? null : (process.env.BANK_SETUP_CODE || crypto.randomBytes(4).toString('hex')).toLowerCase();
     const tls = process.env.TLS_CERT && process.env.TLS_KEY
         ? { cert: fs.readFileSync(process.env.TLS_CERT), key: fs.readFileSync(process.env.TLS_KEY) }
@@ -867,6 +952,7 @@ if (require.main === module) {
         webhookSecret: process.env.BANK_WEBHOOK_SECRET || '',
         setupCode,
         welcomeCompu: demo ? '0.01' : process.env.BANK_WELCOME_COMPU || null,
+        networkPort,
         demoStaff: demo ? DEMO_STAFF : null,
         sbpClient: demo ? new SbpEmulator()
             : process.env.TOCHKA_SBP_TOKEN ? new TochkaSbpClient({

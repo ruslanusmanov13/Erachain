@@ -210,6 +210,31 @@ class NodeBackend {
         return true;
     }
 
+    // публичный ключ счёта (для шифрования сообщения получателю); null — счёт ещё не делал транзакций
+    async publicKey(address) {
+        try {
+            const r = await this.call('addresses/publickey/' + address);
+            return typeof r === 'string' && r ? r : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // данные транзакции для расшифровки на устройстве: зашифрованное сообщение и ключ отправителя
+    async txData(signature) {
+        const tx = await this.call('transactions/signature/' + signature);
+        return {
+            signature, from: tx.creator, to: tx.recipient, creatorPublicKey: tx.publickey, encrypted: !!tx.encrypted,
+            data: tx.encrypted ? tx.data || null : null, message: tx.encrypted ? null : tx.message ?? null, title: tx.title || '',
+        };
+    }
+
+    // расшифровка нодой — для счетов в кошельке ноды (банк, клиенты банка)
+    async decrypt(signature, password) {
+        const r = await this.call('transactions/datadecrypt/' + signature, { query: { password } });
+        return typeof r === 'string' ? r : r.message ?? JSON.stringify(r);
+    }
+
     // состояние транзакции по подписи: в пуле (0 подтверждений), в блоке или не найдена
     async txStatus(signature) {
         try {
@@ -502,6 +527,7 @@ function normalizeTx(tx, owner) {
         direction: incoming ? 'in' : 'out',
         title: tx.title || '',
         message: tx.isText === false || tx.encrypted ? '' : (tx.message || ''),
+        encrypted: !!tx.encrypted,
         fee: tx.fee || '0',
         confirmations: tx.confirmations ?? 0,
     };

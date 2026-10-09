@@ -130,7 +130,13 @@ function fromPrivateKey(key) {
     const s = String(key || '').replace(/\s+/g, '');
     const bytes = s ? base58Decode(s) : null;
     if (!bytes) throw new BankError('В ключе есть недопустимые символы (Base58: без 0, O, I и l)');
-    if (bytes.length > 32 || bytes.length < 30) throw new BankError('Приватный ключ счёта — 44 символа Base58');
+    // 88 символов — ключ NaCl из SDK Erachain (ключ счёта 32 байта + публичный ключ 32 байта)
+    if (bytes.length === 64) {
+        const acc = account(bytes.subarray(0, 32));
+        if (acc.publicKey !== base58Encode(bytes.subarray(32))) throw new BankError('Ключ из 88 символов повреждён: публичная часть не совпадает');
+        return acc;
+    }
+    if (bytes.length > 32 || bytes.length < 30) throw new BankError('Приватный ключ счёта — 44 или 88 символов Base58');
     return account(Buffer.concat([Buffer.alloc(32 - bytes.length), bytes]));
 }
 

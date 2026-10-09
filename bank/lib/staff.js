@@ -32,8 +32,10 @@ const ROLES = {
     account: { name: 'Кабинет счёта', perms: ['read', 'sign', 'statements'] },
     // клиент, зарегистрированный по своей сид-фразе: только свои 21 счёт
     client: { name: 'Клиент', perms: ['read', 'sign', 'statements'] },
+    // кошелёк на устройстве: ключи только на телефоне, операции подписываются там же
+    wallet: { name: 'Кошелёк на устройстве', perms: ['read', 'sign', 'statements'] },
 };
-const SERVICE_ROLES = ['owner', 'account', 'client'];
+const SERVICE_ROLES = ['owner', 'account', 'client', 'wallet'];
 
 const LOGIN_RE = /^[a-z0-9._-]{3,32}$/;
 const AUDIT_MAX = 5000;

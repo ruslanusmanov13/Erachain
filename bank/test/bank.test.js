@@ -784,7 +784,7 @@ test('ключи Erachain: 21 счёт из сид-фразы, адреса ка
     // на байтах < 0x80 совпадает со стандартным RIPEMD160, на остальных — нет (так устроена нода)
     assert.strictEqual(eraRipemd160(Buffer.from('abc')).toString('hex'), crypto.createHash('ripemd160').update('abc').digest('hex'));
     assert.notStrictEqual(eraRipemd160(Buffer.from([0xff])).toString('hex'), crypto.createHash('ripemd160').update(Buffer.from([0xff])).digest('hex'));
-    assert.throws(() => fromPrivateKey('abc'), /44 символа/);
+    assert.throws(() => fromPrivateKey('abc'), /44 или 88 символов/);
 });
 
 test('21 ключ: вход по сид-фразе, выбор кабинета, вход по ключу счёта только в свой счёт', async (t) => {
@@ -994,4 +994,78 @@ test('СБП: двухфазная выплата — ожидание попо�
     await sbp.tick();
     assert.notStrictEqual(sbp.get(good.id).status, 'SBP_ACTIVE', 'хороший заказ не застрял');
     assert.strictEqual(sbp.get(bad.id).status, 'EXPIRED');
+});
+
+test('кошелёк на устройстве: вход подписью, перевод подписан на телефоне, только свои счета, шифрование', async (t) => {
+    const keysJs = await import('../public/js/wallet/keys.js');
+    const txJs = await import('../public/js/wallet/eratx.js');
+    const { DEMO_STAFF, DEMO_SEED } = require('../server');
+    const backend = new DemoBackend({ seed: DEMO_SEED });
+    const server = createServer(backend, { store: new JsonStore(null, {}), demoStaff: DEMO_STAFF, networkPort: 9066 });
+    const base = await listen(server);
+    t.after(() => server.close());
+    const api = async (method, path, body, token) => {
+        const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+        return { status: res.status, data: await res.json() };
+    };
+    // ключи считаются на «устройстве» и совпадают с серверным расчётом и нодой
+    const seed = keysJs.generateSeed();
+    const accs = keysJs.deriveAccounts(seed);
+    assert.deepStrictEqual(accs.map((a) => a.address), require('../lib/erakeys').deriveAccounts(seed).map((a) => a.address));
+
+    // вход: подпись одноразового кода первым ключом; фраза и ключи на сервер не уходят
+    let r = await api('POST', '/api/wallet/challenge');
+    const { nonce, message, port } = r.data;
+    assert.strictEqual(port, 9066);
+    const login = { publicKeys: accs.map((a) => a.publicKeyB58), nonce, signature: txJs.signBytes(accs[0], new TextEncoder().encode(message)) };
+    const wrong = { ...login, signature: txJs.signBytes(accs[1], new TextEncoder().encode(message)) };
+    assert.strictEqual((await api('POST', '/api/wallet/login', wrong)).status, 401);
+    r = await api('POST', '/api/wallet/login', login);
+    assert.strictEqual(r.status, 401, 'код одноразовый');
+    const c2 = (await api('POST', '/api/wallet/challenge')).data;
+    r = await api('POST', '/api/wallet/login', { ...login, nonce: c2.nonce, signature: txJs.signBytes(accs[0], new TextEncoder().encode(c2.message)) });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual(r.data.user.role, 'wallet');
+    const w = r.data.token;
+    r = await api('GET', '/api/accounts', null, w);
+    assert.deepStrictEqual(r.data.map((a) => a.address), accs.map((a) => a.address));
+    assert.strictEqual(bal(r.data[0], 1), '100.00000000'); // демо-подарок
+
+    // перевод подписан на устройстве; сервер только проверяет и отправляет
+    const bank0 = backend.mainAccount;
+    const tx = txJs.buildRSend(accs[0], { recipient: bank0, asset: 1, amount: '2.5', title: 'с телефона', message: 'привет', timestamp: Date.now(), port });
+    const before = backend.accountsMap.get(bank0).get(1);
+    r = await api('POST', '/api/wallet/broadcast', { raw: tx.raw }, w);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.deepStrictEqual([r.data.signature, r.data.amount, r.data.creator], [tx.signature, '2.5', accs[0].address]);
+    assert.strictEqual(backend.accountsMap.get(bank0).get(1) - before, 250000000n);
+    assert.match((await api('POST', '/api/wallet/broadcast', { raw: tx.raw }, w)).data.error, /timestamp/, 'повтор отклоняется');
+    // подпись под другую сеть нода не примет
+    const badPort = txJs.buildRSend(accs[0], { recipient: bank0, asset: 1, amount: '1', timestamp: Date.now() + 5, port: 9046 });
+    assert.match((await api('POST', '/api/wallet/broadcast', { raw: badPort.raw }, w)).data.error, /signature/);
+    // чужой счёт: транзакция, подписанная не ключом кошелька, не отправляется
+    const stranger = keysJs.deriveAccounts(keysJs.generateSeed(), 1)[0];
+    const foreign = txJs.buildRSend(stranger, { recipient: bank0, asset: 1, amount: '1', timestamp: Date.now() + 10, port });
+    assert.strictEqual((await api('POST', '/api/wallet/broadcast', { raw: foreign.raw }, w)).status, 403);
+    // операции через кошелёк ноды кошельку на устройстве недоступны
+    assert.strictEqual((await api('POST', '/api/transfer', { from: accs[0].address, to: bank0, asset: 1, amount: '1' }, w)).status, 403);
+    assert.strictEqual((await api('GET', '/api/staff', null, w)).status, 403);
+
+    // зашифрованное письмо банку: ключ получателя — с сервера, шифрование — на устройстве
+    const pk = (await api('GET', '/api/pubkey/' + bank0, null, w)).data.publicKey;
+    const data = await keysJs.encryptMessage(new TextEncoder().encode('секрет'), accs[0].secretKey, keysJs.unbase58(pk));
+    const letter = txJs.buildRSend(accs[0], { recipient: bank0, title: 'тайна', message: data, encrypted: true, timestamp: Date.now() + 20, port });
+    assert.strictEqual((await api('POST', '/api/wallet/broadcast', { raw: letter.raw }, w)).status, 200);
+    // расшифровка на устройстве: свой ключ + ключ получателя (общий секрет одинаков с обеих сторон)
+    const d = (await api('GET', `/api/tx/${letter.signature}/data`, null, w)).data;
+    assert.ok(d.encrypted && d.data);
+    const plain = await keysJs.decryptMessage(Uint8Array.from(Buffer.from(d.data, 'base64')), accs[0].secretKey, keysJs.unbase58(pk));
+    assert.strictEqual(new TextDecoder().decode(plain), 'секрет');
+    // получатель (банк, ключ из сид-фразы) расшифровывает своим ключом и ключом отправителя
+    const bankKey = keysJs.deriveAccounts(DEMO_SEED, 1)[0];
+    const plain2 = await keysJs.decryptMessage(Uint8Array.from(Buffer.from(d.data, 'base64')), bankKey.secretKey, keysJs.unbase58(d.creatorPublicKey));
+    assert.strictEqual(new TextDecoder().decode(plain2), 'секрет');
+    // ключ из SDK (88 символов) принимается
+    assert.strictEqual(keysJs.fromPrivateKey(keysJs.base58(accs[3].secretKey)).address, accs[3].address);
+    assert.strictEqual(require('../lib/erakeys').fromPrivateKey(keysJs.base58(accs[3].secretKey)).address, accs[3].address);
 });
