@@ -22,10 +22,11 @@ import staffView from './views/staff.js';
 import sbp from './views/sbp.js';
 import invoices from './views/invoices.js';
 import loans from './views/loans.js';
+import keys from './views/keys.js';
 
-const views = { home, transfer, history, assets, polls, exchange, swap, staff: staffView, sbp, invoices, loans, messages, documents, persons, catalog, bank, network, more, settings };
+const views = { keys, home, transfer, history, assets, polls, exchange, swap, staff: staffView, sbp, invoices, loans, messages, documents, persons, catalog, bank, network, more, settings };
 // разделы, доступные из «Сервисов», подсвечивают эту вкладку
-const navOf = { history: 'home', sbp: 'bank', invoices: 'bank', loans: 'bank', swap: 'more', staff: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
+const navOf = { keys: 'more', history: 'home', sbp: 'bank', invoices: 'bank', loans: 'bank', swap: 'more', staff: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
 
 let renderId = 0;
 
@@ -54,19 +55,29 @@ async function render() {
         // без открытой смены сотрудник не видит кошелёк — разделы покажут причину
         if (!state.accounts.length) await loadAccounts().catch((e) => { if (e.status !== 423) throw e; });
         const node = await v.render(params);
-        if (id === renderId) view.replaceChildren(node);
+        if (id === renderId) view.replaceChildren(...[cabinetBar(name), node].filter(Boolean));
     } catch (e) {
         if (id === renderId && session.token) view.replaceChildren(card(el('p', { class: 'error' }, e.message), el('button', { class: 'btn', onclick: render }, 'Повторить')));
     }
     window.scrollTo(0, 0);
 }
 
-function loggedIn(token) {
+// плашка кабинета: владелец вошёл в счёт №n (или это вход по ключу одного счёта)
+function cabinetBar(name) {
+    const me = state.me;
+    if (!me || !me.active || name === 'keys') return null;
+    const acc = state.accounts.find((a) => a.address === me.active);
+    const label = `Кабинет счёта${acc && acc.n ? ' №' + acc.n : ''} · ${me.active.slice(0, 6)}…${me.active.slice(-4)}`;
+    return el('div', { class: 'cabinet-bar' }, el('span', {}, label),
+        me.user.role === 'owner' ? el('a', { href: '#/keys' }, 'Сменить') : null);
+}
+
+function loggedIn(token, hash = '#/home') {
     session.setToken(token);
     state.accounts = [];
     state.me = null;
-    if (!location.hash || location.hash === '#/') location.hash = '#/home';
-    else render();
+    if (location.hash === hash) render();
+    else location.hash = hash;
 }
 
 // какой вход показывать: мастер первого запуска (на ноде нет кошелька) или обычный вход
@@ -100,11 +111,11 @@ function showLogin(setup) {
         const f = form([
             byPassword
                 ? field('Пароль кошелька ноды', input('password', { type: 'password', autocomplete: 'current-password', required: true }))
-                : field('Сид-фраза', seedInput('seed', { autofocus: true }), 'Фраза вводится только для входа и нигде не сохраняется'),
+                : field('Сид-фраза', seedInput('seed', { autofocus: true }), 'Откроются 21 счёт с приватными ключами — выберите любой для входа в кабинет'),
         ], 'Войти', async (data, formEl) => {
-            const { token } = await post('login', byPassword ? { password: data.password } : { seed: data.seed });
+            const r = await post('login', byPassword ? { password: data.password } : { seed: data.seed });
             formEl.reset();
-            loggedIn(token);
+            loggedIn(r.token, r.keys ? '#/keys' : '#/home');
         });
         const toggle = el('a', { href: '#', class: 'small' }, byPassword ? 'Войти сид-фразой' : 'Войти паролем кошелька');
         toggle.addEventListener('click', (e) => {
@@ -130,14 +141,24 @@ function showLogin(setup) {
             loggedIn(token);
         }),
     ];
+    const keyForm = () => [
+        el('p', { class: 'muted small' }, 'Приватный ключ одного из 21 счёта банка открывает кабинет только этого счёта: остатки, переводы, документы, голосования.'),
+        form([
+            field('Приватный ключ счёта', seedInput('key', { placeholder: '44 символа Base58' }), 'Ключ выдаёт владелец банка. Он нигде не сохраняется'),
+        ], 'Войти в кабинет', async (data, formEl) => {
+            const { token } = await post('login', { key: data.key });
+            formEl.reset();
+            loggedIn(token);
+        }),
+    ];
     // пока сид-фраза не привязана, владелец входит паролем кошелька
     const show = (k) => {
         loginTab = k;
-        body.replaceChildren(...(k === 'staff' ? staffForm() : ownerForm(!setup.seedLogin)));
+        body.replaceChildren(...(k === 'staff' ? staffForm() : k === 'key' ? keyForm() : ownerForm(!setup.seedLogin)));
     };
     show(loginTab);
     $('view').replaceChildren(el('div', { class: 'login-wrap' },
-        card(el('h2', {}, 'Вход'), tabs([['owner', 'Владелец'], ['staff', 'Сотрудник']], loginTab, show), body),
+        card(el('h2', {}, 'Вход'), tabs([['owner', 'Владелец'], ['key', 'Ключ счёта'], ['staff', 'Сотрудник']], loginTab, show), body),
         serverLine(),
     ));
 }
@@ -169,7 +190,7 @@ function showServerSetup() {
 function showUser() {
     const me = state.me;
     if (!me) return;
-    const shift = me.user.role === 'owner' ? '' : me.shift.open ? ' · смена открыта' : ' · смена закрыта';
+    const shift = ['owner', 'account'].includes(me.user.role) ? '' : me.shift.open ? ' · смена открыта' : ' · смена закрыта';
     $('status').dataset.user = `${me.user.name} (${me.role.toLowerCase()})${shift}`;
     $('status').title = $('status').dataset.user;
 }
@@ -193,6 +214,7 @@ setUnauthorizedHandler(() => {
 });
 
 window.addEventListener('hashchange', render);
+window.addEventListener('bank:user', () => { showUser(); refreshStatus(); });
 window.addEventListener('bank:logout', async () => {
     try { await post('logout'); } catch (e) { /* ignore */ }
     session.setToken(null);

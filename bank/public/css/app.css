@@ -316,3 +316,11 @@ a.list-item, a.list-item:visited { color: inherit; text-decoration: none; }
 .choice .btn span { font-weight: 400; font-size: 13px; opacity: .8; }
 .check-row { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; }
 .check-row input { margin-top: 3px; }
+.seed-box {
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 17px; line-height: 1.5; letter-spacing: .3px;
+    padding: 12px 14px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border);
+    color: var(--text); word-break: break-all; user-select: all; -webkit-user-select: all;
+}
+.key-row .mono { word-break: break-all; }
+.cabinet-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-radius: 10px; background: var(--primary-soft); color: var(--primary); font-size: 14px; }
+.cabinet-bar a { color: inherit; font-weight: 600; }

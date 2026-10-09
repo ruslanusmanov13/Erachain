@@ -698,7 +698,7 @@ test('первый запуск: создание банка по сид-фра�
     assert.deepStrictEqual(r.data, { walletExists: false, seedLogin: false, needCode: true });
     assert.strictEqual((await api('POST', '/api/login', { password: 'whatever1' })).status, 401);
     const { data: { seed } } = await api('POST', '/api/setup/seed');
-    assert.match(seed, /^(\w{4} ){10}\w{1,4}$/);
+    assert.match(seed, /^[1-9A-HJ-NP-Za-km-z]{43,44}$/, 'одна строка Base58, как в кошельке Erachain');
     r = await api('POST', '/api/setup/create', { seed, password: 'secret123', code: 'wrong' });
     assert.strictEqual(r.status, 403);
     r = await api('POST', '/api/setup/create', { seed, password: 'short', code: 'ABCD1234' });
@@ -710,7 +710,7 @@ test('первый запуск: создание банка по сид-фра�
     assert.deepStrictEqual((await api('GET', '/api/setup')).data, { walletExists: true, seedLogin: true, needCode: false });
 
     // вход по сид-фразе: пробелы и переносы не важны, чужая фраза не подходит
-    r = await api('POST', '/api/login', { seed: seed.replace(/ /g, '\n') });
+    r = await api('POST', '/api/login', { seed: ' ' + seed + '\n' });
     assert.strictEqual(r.status, 200);
     const token = r.data.token;
     assert.ok((await api('GET', '/api/accounts', null, token)).data.length > 0);
@@ -742,4 +742,80 @@ test('сид-фраза: администратор и сотрудники её
     await call('POST', '/api/security/seed/show', { password: 'demo12345' });
     const audit = JSON.stringify((await call('GET', '/api/audit')).data);
     assert.ok(audit.includes('/api/security/seed/show') && !audit.includes('demo12345'));
+});
+
+test('ключи Erachain: 21 счёт из сид-фразы, адреса как у ноды (её RIPEMD160 со знаковыми байтами)', () => {
+    const { deriveAccounts, fromPrivateKey, eraRipemd160, ACCOUNTS } = require('../lib/erakeys');
+    // контрольные значения получены от ноды Erachain (кошелёк тестовой сети, addresses/makepairbyaccountseed)
+    const seed = 'CEeZikJ41SDd4Q9RBbmRYRBJjRfeG9Vc2CmsXqe2bvvu';
+    const list = deriveAccounts(seed);
+    assert.strictEqual(list.length, ACCOUNTS);
+    assert.strictEqual(ACCOUNTS, 21);
+    assert.deepStrictEqual(list[0], {
+        n: 1, address: '7Az8r7aH8Z173SRYRoHemQgbGgidorJCaK',
+        publicKey: 'JvHFoAjUzjh2LXNxYkvBKRt1jc7Fqh6S1pzJGYTFqur', privateKey: 'PYbfwczbi8TaGV5iii2r9PPFhhCFb8x9bXjCkTxv68R',
+    });
+    assert.strictEqual(list[1].address, '77Kj7JraVAwaC2sk46en42Kq6GMoM84JpV');
+    assert.strictEqual(fromPrivateKey(list[5].privateKey).address, list[5].address);
+    assert.strictEqual(new Set(list.map((a) => a.address)).size, 21);
+    // на байтах < 0x80 совпадает со стандартным RIPEMD160, на остальных — нет (так устроена нода)
+    assert.strictEqual(eraRipemd160(Buffer.from('abc')).toString('hex'), crypto.createHash('ripemd160').update('abc').digest('hex'));
+    assert.notStrictEqual(eraRipemd160(Buffer.from([0xff])).toString('hex'), crypto.createHash('ripemd160').update(Buffer.from([0xff])).digest('hex'));
+    assert.throws(() => fromPrivateKey('abc'), /44 символа/);
+});
+
+test('21 ключ: вход по сид-фразе, выбор кабинета, вход по ключу счёта только в свой счёт', async (t) => {
+    const { DEMO_STAFF, DEMO_SEED } = require('../server');
+    const { deriveAccounts } = require('../lib/erakeys');
+    const backend = new DemoBackend({ seed: DEMO_SEED });
+    const server = createServer(backend, { store: new JsonStore(null, {}), demoStaff: DEMO_STAFF });
+    const base = await listen(server);
+    t.after(() => server.close());
+    const api = async (method, path, body, token) => {
+        const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+        return { status: res.status, data: await res.json() };
+    };
+    const keys = deriveAccounts(DEMO_SEED);
+    let r = await api('POST', '/api/login', { seed: DEMO_SEED });
+    assert.strictEqual(r.data.keys, 21);
+    const owner = r.data.token;
+    r = await api('GET', '/api/keys', null, owner);
+    assert.deepStrictEqual(r.data.map((k) => k.privateKey), keys.map((k) => k.privateKey));
+    r = await api('GET', '/api/accounts', null, owner);
+    assert.strictEqual(r.data.length, 21);
+    assert.deepStrictEqual(r.data.map((a) => a.n).sort((x, y) => x - y), keys.map((k) => k.n));
+
+    // владелец выбирает кабинет счёта №2 — видит только его, потом возвращается ко всем
+    await api('POST', '/api/session/account', { address: keys[1].address }, owner);
+    r = await api('GET', '/api/accounts', null, owner);
+    assert.deepStrictEqual(r.data.map((a) => a.address), [keys[1].address]);
+    assert.strictEqual((await api('GET', '/api/me', null, owner)).data.active, keys[1].address);
+    assert.strictEqual((await api('POST', '/api/session/account', { address: A }, owner)).status, 404);
+    await api('POST', '/api/session/account', { address: null }, owner);
+    assert.strictEqual((await api('GET', '/api/accounts', null, owner)).data.length, 21);
+
+    // вход по приватному ключу счёта №1: только свой счёт
+    r = await api('POST', '/api/login', { key: keys[0].privateKey });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual(r.data.user.role, 'account');
+    const cab = r.data.token;
+    r = await api('GET', '/api/accounts', null, cab);
+    assert.deepStrictEqual(r.data.map((a) => a.address), [keys[0].address]);
+    r = await api('POST', '/api/transfer', { from: keys[0].address, to: keys[1].address, asset: 1, amount: '1.5' }, cab);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    r = await api('POST', '/api/transfer', { from: keys[1].address, to: keys[0].address, asset: 1, amount: '1' }, cab);
+    assert.strictEqual(r.status, 403, 'с чужого счёта нельзя');
+    assert.strictEqual((await api('GET', `/api/accounts/${keys[1].address}/history`, null, cab)).status, 403);
+    assert.strictEqual((await api('GET', `/api/accounts/${keys[0].address}/history`, null, cab)).status, 200);
+    for (const [m, p] of [['GET', '/api/staff'], ['GET', '/api/keys'], ['GET', '/api/bank/deposits'], ['POST', '/api/session/account'], ['GET', '/api/loans'], ['POST', '/api/shift/open']]) {
+        assert.strictEqual((await api(m, p, m === 'POST' ? {} : null, cab)).status, 403, `${m} ${p}`);
+    }
+    // чужой ключ и ключ не из банка
+    r = await api('POST', '/api/login', { key: require('../lib/seed').generateSeed() });
+    assert.strictEqual(r.status, 401);
+    assert.match(r.data.error, /ни к одному из 21/);
+
+    // владелец отключил вход по фразе — кабинеты по ключам закрываются
+    await api('POST', '/api/security/seed/unbind', { password: 'demo12345' }, owner);
+    assert.strictEqual((await api('GET', '/api/accounts', null, cab)).status, 401);
 });

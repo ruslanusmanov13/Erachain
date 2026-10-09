@@ -44,7 +44,7 @@ export default {
         }
         const valuation = el('div', { class: 'muted small num' });
         root.append(el('section', { class: 'card hero stack' },
-            el('div', { class: 'muted small' }, `Всего на ${accounts.length} ${accounts.length === 1 ? 'счёте' : 'счетах'}`),
+            el('div', { class: 'muted small' }, `Всего на ${accounts.length} ${accounts.length % 10 === 1 && accounts.length % 100 !== 11 ? 'счёте' : 'счетах'}`),
             el('div', { class: 'big num' }, fmt(totalEra, 4) + ' ERA'),
             el('div', { class: 'muted small num' }, fmt(totalCompu, 6) + ' COMPU на комиссии'),
             valuation));
@@ -86,7 +86,9 @@ export default {
                 newBtn.disabled = false;
             }
         });
-        root.append(el('div', { class: 'row between' }, el('h3', { class: 'section-title' }, 'Счета'), newBtn), strip);
+        // в кабинете одного счёта новые счета не открываются
+        const cabinet = state.me && state.me.active;
+        root.append(el('div', { class: 'row between' }, el('h3', { class: 'section-title' }, cabinet ? 'Счёт' : 'Счета'), cabinet ? null : newBtn), strip);
 
         const acc = currentAccount();
         if (!acc) {

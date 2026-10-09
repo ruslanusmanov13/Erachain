@@ -15,6 +15,7 @@ const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
 const { Invoices } = require('./lib/invoices');
 const { Loans } = require('./lib/loans');
 const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed } = require('./lib/seed');
+const { ACCOUNTS, deriveAccounts } = require('./lib/erakeys');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -98,7 +99,13 @@ function createApp(backend, options = {}) {
             sessions.delete(token);
             throw new BankError('Сессия истекла, войдите снова', 401);
         }
-        if (s.user.role !== 'owner') {
+        if (s.user.role === 'account') {
+            // кабинет по ключу счёта живёт, пока включён вход по сид-фразе
+            if (!ownerKey.hasAccount(s.user.address)) {
+                sessions.delete(token);
+                throw new BankError('Вход по ключу счёта отключён владельцем', 401);
+            }
+        } else if (s.user.role !== 'owner') {
             // отключённый или удалённый сотрудник теряет доступ сразу
             const u = store.data.staff.find((x) => x.id === s.user.id);
             if (!u || u.disabled) {
@@ -119,7 +126,8 @@ function createApp(backend, options = {}) {
 
     // права на маршрут: GET — просмотр, остальное — по разделу; список прав — все обязательны
     function permsFor(method, pathname) {
-        if (pathname === '/api/logout' || pathname === '/api/me') return [];
+        if (pathname === '/api/logout' || pathname === '/api/me' || pathname === '/api/session/account') return [];
+        if (pathname === '/api/keys') return ['wallet'];
         if (pathname.startsWith('/api/security')) return ['wallet'];
         if (pathname.startsWith('/api/loans')) {
             if (method === 'GET' || pathname === '/api/loans/preview') return ['read'];
@@ -171,6 +179,7 @@ function createApp(backend, options = {}) {
     }
 
     async function readJson(req) {
+        if (req.bankBody !== undefined) return req.bankBody; // тело уже прочитано (проверка кабинета)
         const raw = await readRaw(req);
         if (!raw.length) return {};
         try {
@@ -211,14 +220,54 @@ function createApp(backend, options = {}) {
         throw new BankError('Формат: csv, 1c или camt053');
     }
 
+    // кабинет одного счёта: какие маршруты доступны и какое поле запроса — счёт, от имени которого подпись
+    const CABINET_SIGNER = [
+        ['/api/transfer', 'from'], ['/api/transfer/batch', 'from'], ['/api/messages', 'from'],
+        ['/api/assets', 'creator'], ['/api/polls', 'creator'], [/^\/api\/polls\/\d+\/vote$/, 'voter'],
+        ['/api/exchange/orders', 'creator'], ['/api/exchange/cancel', 'creator'],
+        ['/api/documents', 'creator'], ['/api/documents/vouch', 'creator'],
+        ['/api/persons', 'creator'], ['/api/persons/certify', 'creator'],
+    ];
+    const CABINET_GET = /^\/api\/(me|network|accounts|assets(\/\d+|\/types)?|polls(\/\d+)?|persons(\/\d+)?|catalog\/(statuses|templates)|exchange\/\d+\/\d+|documents\/verify\/\w+)$/;
+    const CABINET_GET_OWN = /^\/api\/(?:accounts\/([^/]+)\/history|exchange\/orders\/([^/]+)|messages\/([^/]+))$/;
+
+    async function checkCabinet(req, url, address) {
+        const p = url.pathname;
+        const denied = () => new BankError('В кабинете счёта доступны только операции этого счёта', 403);
+        if (req.method === 'GET') {
+            if (CABINET_GET.test(p)) return;
+            const m = p.match(CABINET_GET_OWN);
+            if (m && (m[1] || m[2] || m[3]) === address) return;
+            if (p === '/api/bank/statement' && url.searchParams.get('address') === address) return;
+            throw denied();
+        }
+        if (p === '/api/logout') return;
+        const rule = CABINET_SIGNER.find(([r]) => (typeof r === 'string' ? r === p : r.test(p)));
+        if (!rule || req.method !== 'POST') throw denied();
+        const body = await readJson(req);
+        if (body[rule[1]] !== address) throw denied();
+    }
+
+    // в кошельке ноды должны быть все 21 счёт сид-фразы: недостающие открываем (нода выдаёт их по порядку)
+    async function ensureAccounts(password, derived) {
+        const have = new Set(await backend.walletAddresses(password));
+        for (let i = 0; i < ACCOUNTS + 5 && derived.some((a) => !have.has(a.address)); i++) {
+            have.add((await backend.openAccount(password)).address);
+        }
+        return derived.filter((a) => !have.has(a.address)).map((a) => a.n);
+    }
+
     async function requireNoWallet() {
         const w = await backend.walletInfo();
         if (w.exists) throw new BankError('Кошелёк на ноде уже создан — войдите сид-фразой или паролем', 409);
     }
 
-    function ownerSession(password) {
+    // keys — 21 счёт сид-фразы с приватными ключами: только в памяти сессии владельца, вошедшего фразой
+    function ownerSession(password, keys = null) {
         const user = staff.owner();
-        return { token: openSession(password, user), user, shift: staff.shiftInfo() };
+        const token = openSession(password, user);
+        if (keys) sessions.get(token).keys = keys;
+        return { token, user, shift: staff.shiftInfo(), keys: keys ? keys.length : 0 };
     }
 
     // неверный пароль кошелька внутри сессии — 403, а не 401: иначе приложение решит, что сессия закончилась
@@ -260,14 +309,41 @@ function createApp(backend, options = {}) {
             checkWalletPassword(password);
             const norm = normalizeSeed(seed);
             await backend.createWallet(norm, password);
+            const keys = deriveAccounts(norm);
+            await ensureAccounts(password, keys);
             ownerKey.bind(norm, password);
             failures.delete(ip);
-            return ownerSession(password);
+            return ownerSession(password, keys);
         }, { public: true }],
 
         ['POST', '/api/login', async ({ req, ip }) => {
             checkThrottle(ip);
-            const { login, password, seed } = await readJson(req);
+            const { login, password, seed, key } = await readJson(req);
+            if (key !== undefined) {
+                // кабинет одного счёта по его приватному ключу
+                let r;
+                try {
+                    r = ownerKey.unlockAccount(key);
+                } catch (e) {
+                    if (e.status !== 409) loginFailed(ip);
+                    throw e;
+                }
+                if (!r) {
+                    loginFailed(ip);
+                    throw new BankError('Ключ не подходит ни к одному из 21 счёта этого банка', 401);
+                }
+                try {
+                    await backend.login(r.walletPassword);
+                } catch (e) {
+                    if (e.status === 502) throw e;
+                    throw new BankError('Пароль кошелька на ноде изменился: владелец должен привязать сид-фразу заново', 409);
+                }
+                failures.delete(ip);
+                const user = { id: 'key:' + r.account.address, login: 'счёт №' + r.account.n, name: `Счёт №${r.account.n}`, role: 'account', address: r.account.address };
+                const token = openSession(r.walletPassword, user);
+                sessions.get(token).active = r.account.address;
+                return { token, user, shift: staff.shiftInfo() };
+            }
             if (seed !== undefined) {
                 // вход владельца по сид-фразе: из неё расшифровывается пароль кошелька
                 let walletPassword;
@@ -288,7 +364,9 @@ function createApp(backend, options = {}) {
                     throw new BankError('Пароль кошелька на ноде изменился: войдите паролем кошелька и привяжите сид-фразу заново', 409);
                 }
                 failures.delete(ip);
-                return ownerSession(walletPassword);
+                const keys = deriveAccounts(seed);
+                await ensureAccounts(walletPassword, keys).catch((e) => console.warn('счета сид-фразы:', e.message));
+                return ownerSession(walletPassword, keys);
             }
             if (typeof password !== 'string' || !password) throw new BankError('Введите пароль');
             if (login && String(login).trim()) {
@@ -324,7 +402,25 @@ function createApp(backend, options = {}) {
         ['GET', '/api/network', () => backend.network()],
         ['GET', '/api/me', ({ session }) => ({
             user: session.user, role: ROLES[session.user.role].name, perms: ROLES[session.user.role].perms, shift: staff.shiftInfo(),
+            active: session.raw.active || null, keys: session.raw.keys ? session.raw.keys.length : 0,
         })],
+        // 21 счёт сид-фразы с приватными ключами (только после входа фразой)
+        ['GET', '/api/keys', ({ session }) => {
+            if (!session.raw.keys) throw new BankError('Ключи показываются после входа по сид-фразе', 409);
+            return session.raw.keys;
+        }],
+        // кабинет: выбранный счёт; null — все счета банка
+        ['POST', '/api/session/account', async ({ req, session }) => {
+            const { address } = await readJson(req);
+            if (address === null || address === undefined || address === '') {
+                session.raw.active = null;
+                return { active: null };
+            }
+            const own = await backend.walletAddresses(session.password);
+            if (!own.includes(address)) throw new BankError('Такого счёта нет в кошельке банка', 404);
+            session.raw.active = address;
+            return { active: address };
+        }],
 
         // сотрудники, смена, журнал
         ['GET', '/api/staff', () => ({ staff: staff.list(), roles: Staff.roles() })],
@@ -352,11 +448,14 @@ function createApp(backend, options = {}) {
             const { password } = await readJson(req);
             return { seed: formatSeed(await walletCheck(backend.exportSeed(checkWalletPassword(password)))) };
         }],
-        ['POST', '/api/security/seed/bind', async ({ req }) => {
+        ['POST', '/api/security/seed/bind', async ({ req, session }) => {
             const { password, seed } = await readJson(req);
             const actual = await walletCheck(backend.exportSeed(checkWalletPassword(password)));
             seedBytes(seed);
             if (!sameSeed(actual, seed)) throw new BankError('Фраза не совпадает с кошельком ноды — проверьте запись');
+            const keys = deriveAccounts(actual);
+            await ensureAccounts(password, keys);
+            session.raw.keys = keys;
             return ownerKey.bind(normalizeSeed(actual), password);
         }],
         ['POST', '/api/security/seed/unbind', async ({ req }) => {
@@ -368,7 +467,12 @@ function createApp(backend, options = {}) {
         }],
 
         // счета и переводы
-        ['GET', '/api/accounts', ({ session }) => backend.accounts(session.password)],
+        ['GET', '/api/accounts', async ({ session }) => {
+            const list = await backend.accounts(session.password);
+            // в кабинете — только выбранный счёт; номер счёта сид-фразы, если он известен
+            const nums = new Map((store.data.ownerKey && store.data.ownerKey.accounts || []).map((a) => [a.address, a.n]));
+            return list.filter((a) => !session.raw.active || a.address === session.raw.active).map((a) => ({ ...a, n: nums.get(a.address) || null }));
+        }],
         ['POST', '/api/accounts', ({ session }) => backend.openAccount(session.password)],
         ['GET', /^\/api\/accounts\/([^/]+)\/history$/, ({ m, url, session }) => {
             const address = decodeURIComponent(m[1]);
@@ -567,6 +671,7 @@ function createApp(backend, options = {}) {
             const r = route(req.method, url.pathname);
             if (!r) throw new BankError('Метод не найден', 404);
             session = r.opts.public ? null : requireSession(req);
+            if (session && session.user.role === 'account') await checkCabinet(req, url, session.user.address);
             if (session) for (const perm of permsFor(req.method, url.pathname)) Staff.require(session.user, perm);
             body = await r.handler({ req, url, m: r.m, session, ip });
         } catch (e) {
@@ -666,7 +771,7 @@ if (require.main === module) {
     });
     server.listen(port, host, () => {
         console.log(`Банк Erachain: ${tls ? 'https' : 'http'}://${host}:${port}`);
-        console.log(demo ? `Демо-режим: сид-фраза ${formatSeed(DEMO_SEED)}; пароль кошелька demo12345; сотрудники kassir/kassir123, buh/buh12345` : 'RPC ноды: ' + rpc);
+        console.log(demo ? `Демо-режим: сид-фраза ${DEMO_SEED}; пароль кошелька demo12345; сотрудники kassir/kassir123, buh/buh12345` : 'RPC ноды: ' + rpc);
         if (!demo) {
             backend.walletInfo().then((w) => {
                 if (!w.exists) console.log(`На ноде нет кошелька. Откройте приложение и создайте банк. Код первого запуска: ${setupCode}`);

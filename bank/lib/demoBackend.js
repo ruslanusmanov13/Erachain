@@ -2,6 +2,8 @@
 
 const crypto = require('crypto');
 const { BankError } = require('./validate');
+const { deriveAccounts } = require('./erakeys');
+const { sameSeed, normalizeSeed } = require('./seed');
 
 const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const FEE = '0.00010000'; // условная комиссия сети в COMPU
@@ -43,7 +45,10 @@ class DemoBackend {
         // fresh — кошелька ещё нет: приложение покажет мастер первого запуска
         this.password = fresh ? null : password;
         this.walletExists = !fresh;
-        this.seed = fresh ? null : seed || base58(crypto.randomBytes(32));
+        // счета демо-банка — 21 счёт сид-фразы, как у настоящей ноды
+        this.worldSeed = seed || base58(crypto.randomBytes(32));
+        this.seed = fresh ? null : this.worldSeed;
+        const own = deriveAccounts(this.worldSeed).map((x) => x.address);
         this.height = 1500000;
         this.accountsMap = new Map(); // address -> Map(assetKey -> units)
         this.txs = [];
@@ -60,11 +65,12 @@ class DemoBackend {
         this.addAsset({ key: 2, name: 'COMPU', description: 'Вычислительная единица для оплаты комиссий сети', scale: 8, quantity: 0, maker: 'genesis' });
         this.addAsset({ key: 1048, name: 'Цифровой рубль (токен)', description: 'Токен, обеспеченный рублями на счёте оператора шлюза', scale: 2, quantity: 0, maker: 'gateway' });
 
-        const a = this.addAccount({ 1: '1250.5', 2: '10', 1048: '15000' });
-        const b = this.addAccount({ 1: '300', 2: '2.5' });
+        const a = this.addAccount({ 1: '1250.5', 2: '10', 1048: '15000' }, own[0]);
+        const b = this.addAccount({ 1: '300', 2: '2.5' }, own[1]);
         this.mainAccount = a;
         // счёт шлюза: хранит выпуск токена «цифровой рубль»
-        this.gatewayAccount = this.addAccount({ 2: '50', 1048: '1000000' });
+        this.gatewayAccount = this.addAccount({ 2: '50', 1048: '1000000' }, own[2]);
+        for (const address of own.slice(3)) this.addAccount({}, address);
         const client = randomAddress();
         this.record('transfer', { from: randomAddress(), to: a, asset: 1, amount: '1250.5', title: 'Начальное зачисление' }).height -= 100;
         this.record('transfer', { from: randomAddress(), to: b, asset: 1, amount: '300', title: 'Начальное зачисление' }).height -= 100;
@@ -91,6 +97,12 @@ class DemoBackend {
         this.orders.push(this.makeOrder(external, 1, 2, '100', '5'));
         this.orders.push(this.makeOrder(external, 2, 1, '3', '62'));
 
+        if (fresh) {
+            // кошелька ещё нет: счета демо-банка ждут восстановления по его сид-фразе
+            this.worldAccounts = this.accountsMap;
+            this.accountsMap = new Map();
+        }
+
         this.timer = setInterval(() => { this.height += 1; }, blockMs);
         if (this.timer.unref) this.timer.unref(); // в браузере (демо-страница) unref нет
     }
@@ -101,8 +113,7 @@ class DemoBackend {
         this.assetsMap.set(a.key, { type: 'Цифровой актив', unlimited: !a.quantity, released: '0', ...a, timestamp: Date.now() });
     }
 
-    addAccount(balances = {}) {
-        const address = randomAddress();
+    addAccount(balances = {}, address = randomAddress()) {
         const map = new Map();
         for (const [k, v] of Object.entries(balances)) map.set(Number(k), toUnits(v));
         this.accountsMap.set(address, map);
@@ -142,8 +153,20 @@ class DemoBackend {
     async createWallet(seed, password) {
         if (this.walletExists) throw new BankError('Нода: wallet already exists');
         if (typeof password !== 'string' || password.length < 8) throw new BankError('Нода: password is too short (need >= 8)');
-        Object.assign(this, { walletExists: true, seed, password });
+        Object.assign(this, { walletExists: true, seed: normalizeSeed(seed), password });
+        if (this.worldAccounts && sameSeed(seed, this.worldSeed)) {
+            this.accountsMap = this.worldAccounts; // восстановлен демо-банк
+        } else {
+            // новый банк: 21 пустой счёт и стартовые ERA/COMPU на первом, чтобы было чем платить комиссии
+            this.accountsMap = new Map();
+            deriveAccounts(seed).forEach((x, i) => this.addAccount(i === 0 ? { 1: '100', 2: '1' } : {}, x.address));
+        }
         return true;
+    }
+
+    async walletAddresses(password) {
+        this.check(password);
+        return [...this.accountsMap.keys()];
     }
 
     async exportSeed(password) {
@@ -236,9 +259,11 @@ class DemoBackend {
         return sum;
     }
 
+    // следующий счёт сид-фразы, как addresses/new у ноды
     async openAccount(password) {
         this.check(password);
-        return { address: this.addAccount({ 1: '0', 2: '0' }) };
+        const next = deriveAccounts(this.seed, this.accountsMap.size + 1).pop().address;
+        return { address: this.addAccount({ 1: '0', 2: '0' }, this.accountsMap.has(next) ? randomAddress() : next) };
     }
 
     async history(address, limit = 50) {

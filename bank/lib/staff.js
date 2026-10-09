@@ -28,6 +28,8 @@ const ROLES = {
     operator: { name: 'Операционист', perms: ['read', 'sign', 'statements', 'gateway'] },
     accountant: { name: 'Бухгалтер', perms: ['read', 'statements', 'gateway'] },
     viewer: { name: 'Наблюдатель', perms: ['read'] },
+    // вход по приватному ключу одного счёта: только этот счёт (ограничения — в server.js)
+    account: { name: 'Кабинет счёта', perms: ['read', 'sign', 'statements'] },
 };
 
 const LOGIN_RE = /^[a-z0-9._-]{3,32}$/;
@@ -56,7 +58,7 @@ class Staff {
     }
 
     static roles() {
-        return Object.entries(ROLES).filter(([k]) => k !== 'owner').map(([key, r]) => ({ key, name: r.name, perms: r.perms }));
+        return Object.entries(ROLES).filter(([k]) => k !== 'owner' && k !== 'account').map(([key, r]) => ({ key, name: r.name, perms: r.perms }));
     }
 
     static can(user, perm) {
@@ -106,7 +108,7 @@ class Staff {
         const login = text(body.login, 32).toLowerCase();
         if (!LOGIN_RE.test(login) || login === 'owner') throw new BankError('Логин: 3–32 символа, латиница, цифры, . _ -');
         if (this.store.data.staff.some((u) => u.login === login)) throw new BankError('Такой логин уже есть');
-        if (!ROLES[body.role] || body.role === 'owner') throw new BankError('Выберите роль');
+        if (!ROLES[body.role] || body.role === 'owner' || body.role === 'account') throw new BankError('Выберите роль');
         const { salt, hash } = hashPassword(this.validatePassword(body.password));
         const u = { id: crypto.randomUUID(), login, name: text(body.name, 120) || login, role: body.role, salt, hash, disabled: false, createdAt: Date.now() };
         this.store.data.staff.push(u);
@@ -118,7 +120,7 @@ class Staff {
         const u = this.find(id);
         if (body.name !== undefined) u.name = text(body.name, 120) || u.login;
         if (body.role !== undefined) {
-            if (!ROLES[body.role] || body.role === 'owner') throw new BankError('Неверная роль');
+            if (!ROLES[body.role] || body.role === 'owner' || body.role === 'account') throw new BankError('Неверная роль');
             u.role = body.role;
         }
         if (body.disabled !== undefined) u.disabled = body.disabled === true;

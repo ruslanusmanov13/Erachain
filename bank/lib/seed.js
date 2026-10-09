@@ -67,9 +67,9 @@ function generateSeed() {
     return base58Encode(crypto.randomBytes(SEED_BYTES));
 }
 
-// группы по 4 символа — так проще записать и сверить
+// сид-фраза показывается одной строкой Base58 — как в кошельке Erachain
 function formatSeed(seed) {
-    return normalizeSeed(seed).match(/.{1,4}/g).join(' ');
+    return normalizeSeed(seed);
 }
 
 function sameSeed(a, b) {
@@ -122,23 +122,51 @@ class OwnerKey {
 
     info() {
         const k = this.store.data.ownerKey;
-        return k ? { bound: true, boundAt: k.boundAt, hint: k.hint } : { bound: false };
+        return k ? { bound: true, boundAt: k.boundAt, hint: k.hint, accounts: (k.accounts || []).length } : { bound: false, accounts: 0 };
     }
 
     key(seed, salt) {
         return crypto.scryptSync(seedBytes(seed), Buffer.from(salt, 'hex'), 32);
     }
 
-    // привязать сид-фразу: сохраняем пароль кошелька, зашифрованный ключом из сида
+    // привязать сид-фразу: сохраняем пароль кошелька, зашифрованный ключом из сида, и отдельно —
+    // ключом каждого из 21 счёта (для входа в кабинет одного счёта по его приватному ключу)
     bind(seed, walletPassword) {
+        const { deriveAccounts } = require('./erakeys');
         const salt = crypto.randomBytes(16).toString('hex');
         const norm = normalizeSeed(seed);
+        const accounts = deriveAccounts(norm).map((a) => {
+            const s = crypto.randomBytes(16).toString('hex');
+            return { n: a.n, address: a.address, salt: s, ...seal(this.accountKey(a.privateKey, s), walletPassword) };
+        });
         this.store.data.ownerKey = {
             salt, ...seal(this.key(seed, salt), walletPassword), boundAt: Date.now(),
             hint: norm.slice(0, 4) + '…' + norm.slice(-4), // чтобы владелец узнал, какая фраза привязана
+            accounts,
         };
         this.store.save();
         return this.info();
+    }
+
+    accountKey(privateKey, salt) {
+        return crypto.scryptSync(base58Decode(privateKey), Buffer.from(salt, 'hex'), 32);
+    }
+
+    hasAccount(address) {
+        const k = this.store.data.ownerKey;
+        return !!(k && (k.accounts || []).some((a) => a.address === address));
+    }
+
+    // вход по приватному ключу счёта: { account, walletPassword } или null, если ключ не из этого банка
+    unlockAccount(privateKey) {
+        const { fromPrivateKey } = require('./erakeys');
+        const acc = fromPrivateKey(privateKey);
+        const k = this.store.data.ownerKey;
+        if (!k) throw new BankError('Вход по ключу счёта ещё не настроен: владелец должен включить вход по сид-фразе', 409);
+        const box = (k.accounts || []).find((a) => a.address === acc.address);
+        if (!box) return null;
+        const walletPassword = open(this.accountKey(acc.privateKey, box.salt), box);
+        return walletPassword ? { account: { n: box.n, address: box.address }, walletPassword } : null;
     }
 
     // пароль кошелька по сид-фразе или null, если фраза не та

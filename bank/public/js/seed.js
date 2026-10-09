@@ -1,17 +1,20 @@
 // Сид-фраза: мастер первого запуска (создать банк или восстановить), показ и привязка фразы владельцем.
 import { get, post } from './api.js';
-import { el, card, field, input, form, toast, date, kv, badge, openDialog, closeDialog } from './ui.js';
+import { el, card, field, input, form, toast, date, kv, badge, copy, openDialog, closeDialog } from './ui.js';
 
-const groups = (seed) => seed.trim().split(/\s+/);
-
-export function seedGrid(seed) {
-    return el('div', { class: 'seed-grid' }, groups(seed).map((g, i) => el('div', { class: 'seed-cell' }, el('small', {}, String(i + 1)), g)));
+// фраза и ключи — одной строкой Base58 (44 символа), как в кошельке Erachain
+export function seedBox(seed, { copyable = true } = {}) {
+    const text = String(seed).replace(/\s+/g, '');
+    return el('div', { class: 'stack' },
+        el('div', { class: 'seed-box' }, text),
+        el('div', { class: 'tiny muted' }, `${text.length} символов Base58 · регистр важен`),
+        copyable ? el('button', { class: 'btn small', type: 'button', onclick: () => copy(text, 'Скопировано — не оставляйте в буфере надолго') }, 'Копировать') : null);
 }
 
 export function seedInput(name = 'seed', attrs = {}) {
     return el('textarea', {
-        name, class: 'seed-input', rows: 3, required: true, spellcheck: 'false', autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off',
-        placeholder: 'Например: 6Vo7 BE54 QbX1 … (пробелы не важны)', ...attrs,
+        name, class: 'seed-input', rows: 2, required: true, spellcheck: 'false', autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off',
+        placeholder: '44 символа Base58 одной строкой', ...attrs,
     });
 }
 
@@ -20,7 +23,7 @@ const WARN = () => el('div', { class: 'warn-box' },
     el('ul', {},
         el('li', {}, 'Запишите её на бумаге и храните в сейфе. Лучше — две копии в разных местах.'),
         el('li', {}, 'Не делайте скриншот, не пересылайте в мессенджерах и почте, не храните в заметках.'),
-        el('li', {}, 'Кто знает фразу, тот распоряжается всеми счетами. Сотрудникам она не нужна — у них свой логин и пароль.'),
+        el('li', {}, 'Кто знает фразу, тот распоряжается всеми 21 счётом банка. Сотрудникам она не нужна — у них свой логин и пароль.'),
         el('li', {}, 'Потеряете фразу и пароль кошелька — доступ к счетам не восстановить.')));
 
 function passwordFields(needCode) {
@@ -45,8 +48,8 @@ export function setupWizard(setup, onDone) {
 
     const create = async (seed, d) => {
         const r = await post('setup/create', { seed, password: d.password, code: d.code });
-        toast('Банк создан. Вы вошли как владелец');
-        onDone(r.token);
+        toast('Банк создан: 21 счёт. Выберите счёт для входа в кабинет');
+        onDone(r.token, r.keys ? '#/keys' : '#/home');
     };
 
     const start = () => step(
@@ -70,42 +73,44 @@ export function setupWizard(setup, onDone) {
         next.addEventListener('click', () => verify(seed));
         step(
             el('h2', {}, 'Шаг 1 из 3. Запишите сид-фразу'),
-            el('p', { class: 'small muted' }, `${groups(seed).length} групп по 4 символа. Различайте заглавные и строчные буквы.`),
-            seedGrid(seed), WARN(),
+            el('p', { class: 'small muted' }, 'Из этой фразы будут созданы 21 счёт банка с приватными ключами. Различайте заглавные и строчные буквы.'),
+            seedBox(seed), WARN(),
             el('label', { class: 'check-row' }, agree, el('span', {}, 'Я записал(а) сид-фразу на бумаге и понимаю, что без неё доступ к деньгам не восстановить')),
             next,
             el('button', { class: 'btn block', type: 'button', onclick: start }, 'Назад'));
     }
 
     function verify(seed) {
-        const g = groups(seed);
+        // три случайных фрагмента по 4 символа: «символы 9–12» и т. п.
+        const parts = Math.floor(seed.length / 4);
         const picks = [];
         while (picks.length < 3) {
-            const i = Math.floor(Math.random() * g.length);
+            const i = Math.floor(Math.random() * parts);
             if (!picks.includes(i)) picks.push(i);
         }
         picks.sort((a, b) => a - b);
+        const label = (i) => `Символы ${i * 4 + 1}–${i * 4 + 4}`;
         step(
             el('h2', {}, 'Шаг 2 из 3. Проверка записи'),
-            el('p', { class: 'small muted' }, 'Введите группы с указанными номерами — так мы убедимся, что фраза записана без ошибок.'),
+            el('p', { class: 'small muted' }, 'Введите указанные символы фразы по вашей записи — так мы убедимся, что она записана без ошибок.'),
             form([
-                el('div', { class: 'seed-check' }, picks.map((i) => field(`№ ${i + 1}`, input('g' + i, { required: true, maxlength: 4, autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' })))),
+                el('div', { class: 'seed-check' }, picks.map((i) => field(label(i), input('g' + i, { required: true, maxlength: 4, autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' })))),
             ], 'Проверить', async (d) => {
-                const bad = picks.filter((i) => (d['g' + i] || '').trim() !== g[i]);
-                if (bad.length) throw new Error(`Не совпадает группа № ${bad.map((i) => i + 1).join(', ')} — сверьтесь с записью (регистр важен)`);
+                const bad = picks.filter((i) => (d['g' + i] || '').trim() !== seed.slice(i * 4, i * 4 + 4));
+                if (bad.length) throw new Error(`Не совпадает: ${bad.map(label).join(', ').toLowerCase()} — сверьтесь с записью (регистр важен)`);
                 passwordStep(seed);
             }),
             el('button', { class: 'btn block', type: 'button', onclick: () => newSeedShow(seed) }, 'Показать фразу ещё раз'));
     }
 
     function newSeedShow(seed) {
-        step(el('h2', {}, 'Сид-фраза'), seedGrid(seed), el('button', { class: 'btn primary block', type: 'button', onclick: () => verify(seed) }, 'Дальше'));
+        step(el('h2', {}, 'Сид-фраза'), seedBox(seed), el('button', { class: 'btn primary block', type: 'button', onclick: () => verify(seed) }, 'Дальше'));
     }
 
     function passwordStep(seed) {
         step(
             el('h2', {}, 'Шаг 3 из 3. Пароль кошелька'),
-            el('p', { class: 'small muted' }, 'Нода создаст кошелёк банка из сид-фразы и зашифрует его этим паролем. Входить вы сможете сид-фразой или этим паролем.'),
+            el('p', { class: 'small muted' }, 'Нода создаст кошелёк банка из сид-фразы — 21 счёт — и зашифрует его этим паролем. Входить вы сможете сид-фразой, приватным ключом любого счёта или этим паролем.'),
             form(passwordFields(setup.needCode), 'Создать банк', async (d) => {
                 checkPasswords(d);
                 await create(seed, d);
@@ -115,7 +120,7 @@ export function setupWizard(setup, onDone) {
     function restore() {
         step(
             el('h2', {}, 'Восстановление по сид-фразе'),
-            el('p', { class: 'small muted' }, 'Нода восстановит из фразы все счета банка. Остатки и история подтянутся из блокчейна после синхронизации ноды.'),
+            el('p', { class: 'small muted' }, 'Нода восстановит из фразы 21 счёт банка. Остатки и история подтянутся из блокчейна после синхронизации ноды.'),
             form([
                 field('Сид-фраза', seedInput()),
                 ...passwordFields(setup.needCode),
@@ -147,7 +152,7 @@ export async function seedSettingsCard() {
     const show = el('button', { class: 'btn block', type: 'button' }, 'Показать сид-фразу');
     show.addEventListener('click', () => askPassword('Показать сид-фразу', 'Убедитесь, что рядом никого нет и экран не записывается.', [], 'Показать', async (d) => {
         const r = await post('security/seed/show', { password: d.password });
-        openDialog(el('h3', {}, 'Сид-фраза банка'), seedGrid(r.seed), WARN(),
+        openDialog(el('h3', {}, 'Сид-фраза банка'), seedBox(r.seed), WARN(),
             el('button', { class: 'btn primary block', type: 'button', onclick: closeDialog }, 'Скрыть'));
     }));
 
@@ -177,7 +182,9 @@ export async function seedSettingsCard() {
             ['Вход по сид-фразе', info.bound ? badge('включён', 'ok') : badge('выключен', 'warn')],
             ['Привязана', info.bound ? date(info.boundAt) : null],
             ['Фраза', info.bound ? el('span', { class: 'mono' }, info.hint) : null],
+            ['Счетов с ключами', info.bound ? String(info.accounts) : null],
         ]),
+        info.bound ? el('a', { class: 'btn soft block', href: '#/keys' }, '21 ключ и кабинеты счетов') : null,
         show, bind, unbind);
     return card(el('h2', {}, 'Сид-фраза'), body);
 }

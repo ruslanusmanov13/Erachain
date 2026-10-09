@@ -1,6 +1,7 @@
 'use strict';
 
 const { BankError } = require('./validate');
+const { ACCOUNTS } = require('./erakeys');
 
 /**
  * Бэкенд, работающий через RPC API ноды Erachain (по умолчанию http://127.0.0.1:9048).
@@ -100,9 +101,15 @@ class NodeBackend {
 
     // создать кошелёк из сид-фразы (новой или для восстановления)
     async createWallet(seed, password) {
-        const r = await this.call('wallet', { body: { seed, password, amount: 1 } });
+        const r = await this.call('wallet', { body: { seed, password, amount: ACCOUNTS } });
         if (String(r) !== 'true') throw new BankError('Нода не смогла создать кошелёк');
         return true;
+    }
+
+    async walletAddresses(password) {
+        const list = await this.call('addresses', { query: { password } });
+        if (!Array.isArray(list)) throw new BankError('Не удалось открыть кошелёк', 401);
+        return list;
     }
 
     async exportSeed(password) {

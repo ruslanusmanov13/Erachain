@@ -1,7 +1,8 @@
 import { el } from '../ui.js';
-import { can } from '../state.js';
+import { can, state } from '../state.js';
 
 const ITEMS = [
+    ['#/keys', 'Ключи и кабинеты', '21 счёт сид-фразы, вход в кабинет', 'M15 7a4 4 0 1 1-3.9 5H3v3h3v3h3v-3h2.1A4 4 0 0 1 15 7z', 'wallet'],
     ['#/history', 'История', 'Все операции по счетам', 'M4 6h16M4 12h16M4 18h10'],
     ['#/sbp', 'Приём по СБП', 'QR-оплата рублями → активы', 'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 18h2v2h-2z'],
     ['#/loans', 'Кредиты', 'Договоры, графики, взыскание', 'M12 3v18M17 7H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6'],
@@ -21,6 +22,8 @@ const ITEMS = [
     ['#/settings', 'Настройки', 'Сид-фраза, сервер, выход', 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19 12l2-1-2-4-2 1-2-2V4h-4v2L9 7 7 6 5 10l2 1v2l-2 1 2 4 2-1 2 2v2h4v-2l2-2 2 1 2-4-2-1z'],
 ];
 
+const CABINET = new Set(['#/history', '#/transfer/batch', '#/polls', '#/exchange/1/2', '#/documents', '#/messages', '#/persons', '#/assets/issue', '#/catalog', '#/network', '#/settings']);
+
 function icon(d) {
     const ns = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(ns, 'svg');
@@ -38,7 +41,10 @@ function icon(d) {
 export default {
     title: 'Сервисы',
     async render() {
-        return el('div', { class: 'menu-grid' }, ITEMS.filter((i) => !i[4] || can(i[4])).map(([href, title, sub, d]) => el('a', { class: 'menu-tile', href },
+        // кабинет по ключу счёта: только разделы, работающие с одним счётом
+        const cabinet = state.me && state.me.user.role === 'account';
+        const items = ITEMS.filter((i) => (!i[4] || can(i[4])) && (!cabinet || CABINET.has(i[0])));
+        return el('div', { class: 'menu-grid' }, items.map(([href, title, sub, d]) => el('a', { class: 'menu-tile', href },
             icon(d), el('b', {}, title), el('span', { class: 'muted' }, sub))));
     },
 };
