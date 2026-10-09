@@ -260,7 +260,7 @@ class SbpService {
         // защита от спама: та же пара «счёт + сумма + актив» в течение 12 минут — тот же заказ
         const same = this.store.data.sbpOrders.find((o) => o.receiver === receiver && o.amountKop === amountKop && o.asset === asset
             && ACTIVE.includes(o.status) && Date.now() - o.createdAt < DEDUPE_MS);
-        if (same) return this.view(same);
+        if (same) return this.view(same, source === 'office');
 
         const order = {
             id: crypto.randomUUID(), status: 'NEW', receiver, asset, assetName: conf.name, scale: conf.scale,
@@ -282,7 +282,7 @@ class SbpService {
         }
         this.store.save();
         if (order.status === 'FAIL_MAKE') throw new BankError('Не удалось создать QR-код: ' + order.message, 502);
-        return this.view(order);
+        return this.view(order, source === 'office');
     }
 
     get(id) {
