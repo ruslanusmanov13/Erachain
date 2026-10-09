@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Банк Erachain</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+    <div class="brand"><span class="logo">E</span> Банк Erachain</div>
+    <div class="status" id="status">Подключение…</div>
+    <button class="btn ghost hidden" id="logoutBtn">Выйти</button>
+</header>
+
+<main>
+    <!-- Вход -->
+    <section class="card login hidden" id="loginView">
+        <h1>Вход в банк</h1>
+        <p class="muted">Введите пароль кошелька ноды Erachain. Пароль передаётся только локальному серверу банка.</p>
+        <form id="loginForm">
+            <label>Пароль кошелька
+                <input type="password" name="password" autocomplete="current-password" required>
+            </label>
+            <button class="btn primary" type="submit">Войти</button>
+            <p class="error" id="loginError"></p>
+        </form>
+    </section>
+
+    <!-- Кабинет -->
+    <section class="dashboard hidden" id="dashView">
+        <aside class="accounts">
+            <div class="row between">
+                <h2>Мои счета</h2>
+                <button class="btn small" id="newAccountBtn" title="Открыть новый счёт">+ Счёт</button>
+            </div>
+            <div class="total" id="total"></div>
+            <ul id="accountList"></ul>
+        </aside>
+
+        <div class="content">
+            <div class="card" id="accountCard">
+                <div class="row between wrap">
+                    <div>
+                        <div class="muted small">Счёт</div>
+                        <div class="address" id="currentAddress">—</div>
+                    </div>
+                    <button class="btn small ghost" id="copyBtn">Копировать</button>
+                </div>
+                <div class="balances" id="currentBalances"></div>
+            </div>
+
+            <div class="tabs">
+                <button class="tab active" data-tab="history">История</button>
+                <button class="tab" data-tab="transfer">Перевод</button>
+            </div>
+
+            <div class="card tab-panel" id="tab-history">
+                <table class="history">
+                    <thead><tr><th>Дата</th><th>Операция</th><th>Контрагент</th><th class="right">Сумма</th></tr></thead>
+                    <tbody id="historyBody"></tbody>
+                </table>
+                <p class="muted empty hidden" id="historyEmpty">Операций пока нет</p>
+            </div>
+
+            <div class="card tab-panel hidden" id="tab-transfer">
+                <form id="transferForm" class="grid">
+                    <label>Получатель
+                        <input name="to" placeholder="7…" required autocomplete="off" spellcheck="false">
+                    </label>
+                    <div class="row gap">
+                        <label class="grow">Сумма
+                            <input name="amount" inputmode="decimal" placeholder="0.00" required>
+                        </label>
+                        <label>Актив
+                            <select name="asset" id="assetSelect"></select>
+                        </label>
+                    </div>
+                    <label>Назначение платежа
+                        <input name="title" maxlength="250" placeholder="Например: оплата по счёту №15">
+                    </label>
+                    <label>Сообщение получателю
+                        <textarea name="message" rows="3" maxlength="4000"></textarea>
+                    </label>
+                    <p class="muted small">Комиссия сети списывается в COMPU с вашего счёта.</p>
+                    <button class="btn primary" type="submit">Отправить</button>
+                    <p class="error" id="transferError"></p>
+                </form>
+            </div>
+        </div>
+    </section>
+</main>
+
+<dialog id="confirmDialog">
+    <form method="dialog">
+        <h3>Подтвердите перевод</h3>
+        <p id="confirmText"></p>
+        <div class="row gap end">
+            <button class="btn ghost" value="cancel">Отмена</button>
+            <button class="btn primary" value="ok">Подтвердить</button>
+        </div>
+    </form>
+</dialog>
+
+<div class="toast hidden" id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

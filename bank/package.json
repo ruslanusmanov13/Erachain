@@ -1,0 +1,14 @@
+{
+  "name": "erachain-bank",
+  "version": "1.0.0",
+  "description": "Банк Erachain — веб-приложение для управления счетами и переводами через RPC API ноды Erachain",
+  "main": "server.js",
+  "license": "MIT",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "demo": "node server.js --demo",
+    "test": "node --test test/*.test.js"
+  }
+}
