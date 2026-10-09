@@ -230,6 +230,28 @@ async function gatewaySettings() {
             });
             toast('Настройки сохранены');
         })),
+        card(form([
+            el('h2', {}, 'Учёт в 1С'),
+            el('p', { class: 'small muted' }, 'Выписки в 1С и camt.053 содержат остатки на начало и конец периода. Суммы в 1С — с копейками, точная сумма актива — в назначении платежа.'),
+            field('Сопоставление счетов: актив = счёт в 1С', el('textarea', { name: 'accounts1C', rows: 3, spellcheck: 'false', placeholder: '1048=40702810900000012345\n1=ERA-01' },
+                Object.entries(s.accounts1C || {}).map(([k, v]) => `${k}=${v}`).join('\n')), 'По строке на актив; без сопоставления — общий счёт для выписок'),
+            field('Контрагенты: адрес;наименование;ИНН;КПП;счёт;БИК;банк;корр. счёт',
+                el('textarea', { name: 'counterparties', rows: 5, spellcheck: 'false', placeholder: '7AbC…;ООО Поставщик;7701234567;770101001;40702810…;044525225;ПАО Банк;30101810…' },
+                    (s.counterparties || []).map((c) => [c.address, c.name, c.inn, c.kpp, c.account, c.bic, c.bank, c.corr].map((x) => x || '').join(';')).join('\n')),
+                'В выписках вместо адреса Erachain будут наименование и реквизиты'),
+        ], 'Сохранить', async (d) => {
+            const accounts1C = {};
+            for (const row of d.accounts1C.split(/\n+/).map((x) => x.trim()).filter(Boolean)) {
+                const [asset, acc] = row.split('=').map((x) => (x || '').trim());
+                accounts1C[asset] = acc;
+            }
+            const counterparties = d.counterparties.split(/\n+/).map((x) => x.trim()).filter(Boolean).map((row) => {
+                const [address, name, inn, kpp, account, bic, bank, corr] = row.split(';').map((x) => (x || '').trim());
+                return { address, name, inn, kpp, account, bic, bank, corr };
+            });
+            await put('bank/settings', { accounts1C, counterparties });
+            toast('Сохранено');
+        })),
         card(el('h2', {}, 'Вебхук банка'), el('p', { class: 'small muted pre-line' },
             'Банк или платёжный агрегатор может сообщать о поступлениях автоматически:\n' +
             'POST /api/bank/webhook с заголовком X-Signature: sha256=HMAC-SHA256(тело, секрет)\n' +

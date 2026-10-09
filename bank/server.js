@@ -21,6 +21,7 @@ const { Clients } = require('./lib/clients');
 const { parseRaw, verifySig } = require('./lib/eratx');
 const { addressOf } = require('./lib/erakeys');
 const formats = require('./lib/bank/formats');
+const ledger = require('./lib/bank/ledger');
 const v = require('./lib/validate');
 
 const { BankError } = v;
@@ -264,20 +265,30 @@ function createApp(backend, options = {}) {
         const to = toRaw + (url.searchParams.get('to') ? 86400000 - 1 : 0); // до конца дня
         if (!Number.isFinite(from) || !Number.isFinite(to)) throw new BankError('Неверный период');
         const format = url.searchParams.get('format') || 'csv';
-        const ops = (await backend.history(address, 200, session.password))
-            .filter((o) => (o.timestamp || 0) >= from && (o.timestamp || 0) <= to)
-            .filter((o) => asset === null || Number(o.asset) === asset);
-        const assetName = asset === null ? '' : (ops.find((o) => o.assetName) || {}).assetName || '#' + asset;
+        // история целиком за период и после него — нужна для остатков на начало и конец
+        const LIMIT = 2000;
+        const history = await backend.history(address, LIMIT, session.password);
+        const limited = history.length >= LIMIT && (history[history.length - 1].timestamp || 0) >= from;
+        let current = null;
+        if (asset !== null && backend.balances) {
+            const b = (await backend.balances(address)).find((x) => Number(x.asset) === asset);
+            current = b ? String(b.amount) : '0';
+        }
+        const st = ledger.buildStatement({ history, address, asset, from, to, current, limited });
+        const assetName = asset === null ? '' : (st.ops.find((o) => o.assetName) || {}).assetName || '#' + asset;
         const s = gateway.settings();
+        const parties = new Map((s.counterparties || []).map((c) => [c.address, c]));
         const meta = {
-            address, assetName, from: from || (ops.length ? ops[ops.length - 1].timestamp : Date.now()), to: Math.min(to, Date.now()),
+            address, assetName, from: from || (st.ops.length ? st.ops[0].timestamp : Date.now()), to: Math.min(to, Date.now()),
             organization: s.organization, currency: asset !== null && asset === s.tokenAsset ? s.currency : (assetName || 'XXX').slice(0, 3).toUpperCase(),
             scale: asset !== null && asset === s.tokenAsset ? 2 : 8,
+            account: asset !== null && s.accounts1C && s.accounts1C[asset] ? s.accounts1C[asset] : null,
+            party: (a) => parties.get(a) || null,
         };
         const base = `statement-${address.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}`;
-        if (format === '1c') return file(base + '.1c.txt', 'text/plain; charset=windows-1251', formats.statement1C(ops, meta));
-        if (format === 'camt053') return file(base + '.camt053.xml', 'application/xml', formats.camt053(ops, meta));
-        if (format === 'csv') return file(base + '.csv', 'text/csv; charset=utf-8', formats.statementCsv(ops, meta));
+        if (format === '1c') return file(base + '.1c.txt', 'text/plain; charset=windows-1251', formats.statement1C(st, meta));
+        if (format === 'camt053') return file(base + '.camt053.xml', 'application/xml', formats.camt053(st, meta));
+        if (format === 'csv') return file(base + '.csv', 'text/csv; charset=utf-8', formats.statementCsv(st, meta));
         throw new BankError('Формат: csv, 1c или camt053');
     }
 

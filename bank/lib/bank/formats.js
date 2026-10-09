@@ -82,24 +82,34 @@ function decodeText(buffer) {
 // ---------- выписка по счёту ----------
 
 /**
- * ops: [{ timestamp, seqNo, signature, type, direction:'in'|'out', from, to, amount, assetName, title, message }]
- * meta: { address, assetName, from, to, organization }
+ * st — выписка из ledger.buildStatement: { ops, inSum, outSum, opening, closing } (суммы — в единицах 1e-8);
+ * ops: [{ timestamp, seqNo, signature, type, direction:'in'|'out', from, to, amount, exact, assetName, title, message }]
+ * meta: { address, assetName, from, to, organization, account, currency, scale, party(address) → реквизиты }
  */
-function statementCsv(ops, meta) {
+function statementCsv(st, meta) {
     const head = ['Дата', 'Время', 'Номер', 'Операция', 'Контрагент', 'Приход', 'Расход', 'Актив', 'Назначение', 'Подпись'];
     const cell = (v) => {
         const s = String(v ?? '');
         return /[;"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    const rows = ops.map((o) => [
-        o.timestamp ? dateRu(o.timestamp) : '', o.timestamp ? timeRu(o.timestamp) : '', o.seqNo || '',
-        o.type || '', o.direction === 'in' ? o.from : o.to,
-        o.direction === 'in' ? o.amount || '' : '', o.direction === 'out' ? o.amount || '' : '',
-        o.assetName || '', line([o.title, o.message].filter(Boolean).join(' — '), 1000), o.signature || '',
-    ]);
-    const title = `Выписка по счёту ${meta.address}${meta.assetName ? ' (' + meta.assetName + ')' : ''}`;
-    const text = [title, head.join(';'), ...rows.map((r) => r.map(cell).join(';'))].join('\r\n') + '\r\n';
-    return Buffer.from('﻿' + text, 'utf8');
+    const party = meta.party || (() => null);
+    const rows = st.ops.map((o) => {
+        const addr = o.direction === 'in' ? o.from : o.to;
+        const p = party(addr);
+        return [
+            o.timestamp ? dateRu(o.timestamp) : '', o.timestamp ? timeRu(o.timestamp) : '', o.seqNo || '',
+            o.type || '', p ? `${p.name} (${addr})` : addr,
+            o.direction === 'in' ? o.exact || '' : '', o.direction === 'out' ? o.exact || '' : '',
+            o.assetName || '', line([o.title, o.message].filter(Boolean).join(' — '), 1000), o.signature || '',
+        ];
+    });
+    const title = `Выписка по счёту ${meta.address}${meta.assetName ? ' (' + meta.assetName + ')' : ''} за ${dateRu(meta.from)}–${dateRu(meta.to)}`;
+    const lines = [title, head.join(';')];
+    if (st.opening !== null && st.opening !== undefined) lines.push(['', '', '', 'Остаток на начало', '', '', '', meta.assetName || '', fmtUnits(st.opening), ''].map(cell).join(';'));
+    lines.push(...rows.map((r) => r.map(cell).join(';')));
+    lines.push(['', '', '', 'Итого обороты', '', fmtUnits(st.inSum), fmtUnits(st.outSum), meta.assetName || '', '', ''].map(cell).join(';'));
+    if (st.closing !== null && st.closing !== undefined) lines.push(['', '', '', 'Остаток на конец', '', '', '', meta.assetName || '', fmtUnits(st.closing), ''].map(cell).join(';'));
+    return Buffer.from('\ufeff' + lines.join('\r\n') + '\r\n', 'utf8');
 }
 
 function oneCHeader(meta, kind) {
@@ -131,6 +141,7 @@ function oneCDocument(d) {
         'ПлательщикСчет=' + line(d.payerAccount, 34),
         'Плательщик=' + line(d.payerName, 160),
         'ПлательщикИНН=' + line(d.payerInn, 12),
+        ...(d.payerKpp ? ['ПлательщикКПП=' + line(d.payerKpp, 9)] : []),
         'Плательщик1=' + line(d.payerName, 160),
         'ПлательщикРасчСчет=' + line(d.payerAccount, 34),
         'ПлательщикБанк1=' + line(d.payerBank, 160),
@@ -139,6 +150,7 @@ function oneCDocument(d) {
         'ПолучательСчет=' + line(d.payeeAccount, 34),
         'Получатель=' + line(d.payeeName, 160),
         'ПолучательИНН=' + line(d.payeeInn, 12),
+        ...(d.payeeKpp ? ['ПолучательКПП=' + line(d.payeeKpp, 9)] : []),
         'Получатель1=' + line(d.payeeName, 160),
         'ПолучательРасчСчет=' + line(d.payeeAccount, 34),
         'ПолучательБанк1=' + line(d.payeeBank, 160),
@@ -153,74 +165,113 @@ function oneCDocument(d) {
     ];
 }
 
+// точная сумма выписки ("12.34000000") → единицы 1e-8
+const u8 = (s) => BigInt(String(s).replace('.', ''));
+
+// единицы 1e-8 (BigInt) → строка
+function fmtUnits(u, scale = 8) {
+    const neg = u < 0n;
+    let a = neg ? -u : u;
+    const drop = 10n ** BigInt(8 - scale);
+    if (drop > 1n) a = (a + drop / 2n) / drop;
+    const s = a.toString().padStart(scale + 1, '0');
+    return (neg && a !== 0n ? '-' : '') + (scale ? s.slice(0, -scale) + '.' + s.slice(-scale) : s);
+}
+
 /**
- * Выписка по счёту блокчейна в формате 1С. Счёт блокчейна отображается как «расчётный счёт»
- * организации: номер берётся из настроек (account1C) или используется адрес Erachain.
+ * Выписка по счёту блокчейна в формате 1С. Счёт блокчейна — «расчётный счёт» организации: номер из
+ * сопоставления счетов (по активу), иначе общий account1C, иначе адрес Erachain. Контрагенты — по
+ * справочнику (наименование, ИНН, КПП, счёт, банк). 1С принимает суммы с копейками: сумма документа
+ * округляется до 2 знаков, точная сумма — в назначении платежа; итоги и остатки сведены по округлённым
+ * суммам, чтобы остаток на начало + поступления − списания = остаток на конец ровно.
  */
-function statement1C(ops, meta) {
+function statement1C(st, meta) {
     const org = meta.organization || {};
-    const account = org.account1C || meta.address;
-    let inSum = 0;
-    let outSum = 0;
-    for (const o of ops) {
-        if (o.direction === 'in') inSum += Number(o.amount || 0);
-        else outSum += Number(o.amount || 0);
-    }
-    const lines = oneCHeader({ ...meta, account }, 'statement');
-    lines.push(
-        'СекцияРасчСчет',
-        'ДатаНачала=' + dateRu(meta.from),
-        'ДатаКонца=' + dateRu(meta.to),
-        'РасчСчет=' + account,
-        'ВсегоПоступило=' + money(inSum),
-        'ВсегоСписано=' + money(outSum),
-        'КонецРасчСчет',
-    );
-    for (const o of ops.filter((x) => x.amount)) {
+    const account = meta.account || org.account1C || meta.address;
+    const party = meta.party || (() => null);
+    const r2 = (u) => (u + (u < 0n ? -500000n : 500000n)) / 1000000n * 1000000n; // до копеек
+    let inSum = 0n;
+    let outSum = 0n;
+    const docs = [];
+    for (const o of st.ops.filter((x) => x.exact)) {
         const incoming = o.direction === 'in';
-        const self = { name: org.name || 'Организация', inn: org.inn, account, bank: 'Erachain', bic: '', corr: '' };
-        const other = { name: incoming ? o.from : o.to, inn: '', account: incoming ? o.from : o.to, bank: 'Erachain', bic: '', corr: '' };
+        const exact = u8(o.exact);
+        const rounded = r2(exact);
+        if (incoming) inSum += rounded;
+        else outSum += rounded;
+        const addr = incoming ? o.from : o.to;
+        const p = party(addr) || {};
+        const self = { name: org.name || 'Организация', inn: org.inn, kpp: org.kpp, account, bank: 'Erachain', bic: '', corr: '' };
+        const other = {
+            name: p.name || addr, inn: p.inn || '', kpp: p.kpp || '', account: p.account || addr,
+            bank: p.bank || 'Erachain', bic: p.bic || '', corr: p.corr || '',
+        };
         const payer = incoming ? other : self;
         const payee = incoming ? self : other;
-        lines.push(...oneCDocument({
-            number: o.seqNo || '', date: o.timestamp || Date.now(), amount: o.amount,
-            payerAccount: payer.account, payerName: payer.name, payerInn: payer.inn, payerBank: payer.bank, payerBic: payer.bic, payerCorr: payer.corr,
-            payeeAccount: payee.account, payeeName: payee.name, payeeInn: payee.inn, payeeBank: payee.bank, payeeBic: payee.bic, payeeCorr: payee.corr,
-            purpose: [o.title, o.message, o.assetName ? `(${o.assetName})` : ''].filter(Boolean).join(' ') || 'Перевод в Erachain',
+        const unit = o.assetName || meta.assetName;
+        const exactNote = rounded !== exact ? ` (точно ${fmtUnits(exact).replace(/\.?0+$/, '')}${unit ? ' ' + unit : ''})` : '';
+        docs.push(...oneCDocument({
+            number: o.seqNo || '', date: o.timestamp || Date.now(), amount: fmtUnits(rounded, 2),
+            payerAccount: payer.account, payerName: payer.name, payerInn: payer.inn, payerKpp: payer.kpp, payerBank: payer.bank, payerBic: payer.bic, payerCorr: payer.corr,
+            payeeAccount: payee.account, payeeName: payee.name, payeeInn: payee.inn, payeeKpp: payee.kpp, payeeBank: payee.bank, payeeBic: payee.bic, payeeCorr: payee.corr,
+            purpose: ([o.title, o.message, unit && !exactNote ? `(${unit})` : ''].filter(Boolean).join(' ') || 'Перевод в Erachain') + exactNote,
             debited: !incoming, credited: incoming,
         }));
     }
-    lines.push('КонецФайла');
+    const lines = oneCHeader({ ...meta, account }, 'statement');
+    const section = ['СекцияРасчСчет', 'ДатаНачала=' + dateRu(meta.from), 'ДатаКонца=' + dateRu(meta.to), 'РасчСчет=' + account];
+    if (st.opening !== null && st.opening !== undefined) {
+        const opening = r2(st.opening);
+        section.push('НачальныйОстаток=' + fmtUnits(opening, 2));
+        section.push('ВсегоПоступило=' + fmtUnits(inSum, 2), 'ВсегоСписано=' + fmtUnits(outSum, 2));
+        section.push('КонечныйОстаток=' + fmtUnits(opening + inSum - outSum, 2));
+    } else {
+        section.push('ВсегоПоступило=' + fmtUnits(inSum, 2), 'ВсегоСписано=' + fmtUnits(outSum, 2));
+    }
+    section.push('КонецРасчСчет');
+    lines.push(...section, ...docs, 'КонецФайла');
     return encodeCp1251(lines.join('\r\n') + '\r\n');
 }
 
-function camt053(ops, meta) {
+function camt053(st, meta) {
     const now = new Date();
     const id = 'ERA' + now.getTime();
     const ccy = meta.currency || 'XXX';
-    let inSum = 0;
-    let outSum = 0;
-    const entries = ops.filter((o) => o.amount).map((o, i) => {
+    const scale = meta.scale ?? 2;
+    const party = meta.party || (() => null);
+    const amt = (u) => fmtUnits(u < 0n ? -u : u, scale);
+    const entries = st.ops.filter((o) => o.exact).map((o, i) => {
         const incoming = o.direction === 'in';
-        if (incoming) inSum += Number(o.amount);
-        else outSum += Number(o.amount);
-        const party = incoming ? `<RltdPties><Dbtr><Nm>${xml(o.from)}</Nm></Dbtr></RltdPties>` : `<RltdPties><Cdtr><Nm>${xml(o.to)}</Nm></Cdtr></RltdPties>`;
+        const addr = incoming ? o.from : o.to;
+        const p = party(addr);
+        const pty = `<Nm>${xml(p ? p.name : addr)}</Nm>${p && p.inn ? `<Id><OrgId><Othr><Id>${xml(p.inn)}</Id><SchmeNm><Cd>TXID</Cd></SchmeNm></Othr></OrgId></Id>` : ''}`;
+        const acct = `<Id><Othr><Id>${xml(p && p.account ? p.account : addr)}</Id></Othr></Id>`;
+        const party1 = incoming ? `<RltdPties><Dbtr>${pty}</Dbtr><DbtrAcct>${acct}</DbtrAcct></RltdPties>` : `<RltdPties><Cdtr>${pty}</Cdtr><CdtrAcct>${acct}</CdtrAcct></RltdPties>`;
         const info = [o.title, o.message].filter(Boolean).join(' — ');
         return `      <Ntry>
         <NtryRef>${i + 1}</NtryRef>
-        <Amt Ccy="${xml(ccy)}">${money(o.amount, meta.scale ?? 2)}</Amt>
+        <Amt Ccy="${xml(ccy)}">${amt(u8(o.exact))}</Amt>
         <CdtDbtInd>${incoming ? 'CRDT' : 'DBIT'}</CdtDbtInd>
-        <Sts>${o.confirmations ? 'BOOK' : 'PDNG'}</Sts>
+        <Sts>BOOK</Sts>
         <BookgDt><DtTm>${new Date(o.timestamp || Date.now()).toISOString()}</DtTm></BookgDt>
         <AcctSvcrRef>${xml(o.seqNo || o.signature || '')}</AcctSvcrRef>
-        <BkTxCd><Prtry><Cd>${xml(o.type || 'TRANSFER')}</Cd><Issr>Erachain</Issr></Prtry></BkTxCd>
+        <BkTxCd><Prtry><Cd>${xml(o.isFee ? 'FEE' : o.type || 'TRANSFER')}</Cd><Issr>Erachain</Issr></Prtry></BkTxCd>
         <NtryDtls><TxDtls>
           <Refs><EndToEndId>${xml(o.signature || 'NOTPROVIDED')}</EndToEndId></Refs>
-          ${party}
+          ${party1}
           <RmtInf><Ustrd>${xml(line(info, 140))}</Ustrd></RmtInf>
         </TxDtls></NtryDtls>
       </Ntry>`;
     });
+    const bal = (code, u, ts) => `      <Bal>
+        <Tp><CdOrPrtry><Cd>${code}</Cd></CdOrPrtry></Tp>
+        <Amt Ccy="${xml(ccy)}">${amt(u)}</Amt>
+        <CdtDbtInd>${u < 0n ? 'DBIT' : 'CRDT'}</CdtDbtInd>
+        <Dt><Dt>${dateIso(ts)}</Dt></Dt>
+      </Bal>`;
+    const balances = st.opening !== null && st.opening !== undefined ? [bal('OPBD', st.opening, meta.from), bal('CLBD', st.closing, meta.to)].join('\n') + '\n' : '';
+    const nIn = st.ops.filter((o) => o.exact && o.direction === 'in').length;
+    const nOut = st.ops.filter((o) => o.exact && o.direction !== 'in').length;
     return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>
 <Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
   <BkToCstmrStmt>
@@ -232,10 +283,11 @@ function camt053(ops, meta) {
       <Id>${id}</Id>
       <CreDtTm>${now.toISOString()}</CreDtTm>
       <FrToDt><FrDtTm>${new Date(meta.from).toISOString()}</FrDtTm><ToDtTm>${new Date(meta.to).toISOString()}</ToDtTm></FrToDt>
-      <Acct><Id><Othr><Id>${xml(meta.address)}</Id><SchmeNm><Prtry>ERACHAIN</Prtry></SchmeNm></Othr></Id><Ccy>${xml(ccy)}</Ccy></Acct>
-      <TxsSummry>
-        <TtlCdtNtries><NbOfNtries>${ops.filter((o) => o.amount && o.direction === 'in').length}</NbOfNtries><Sum>${money(inSum, meta.scale ?? 2)}</Sum></TtlCdtNtries>
-        <TtlDbtNtries><NbOfNtries>${ops.filter((o) => o.amount && o.direction !== 'in').length}</NbOfNtries><Sum>${money(outSum, meta.scale ?? 2)}</Sum></TtlDbtNtries>
+      <Acct><Id><Othr><Id>${xml(meta.account || meta.address)}</Id><SchmeNm><Prtry>${meta.account ? 'BANK' : 'ERACHAIN'}</Prtry></SchmeNm></Othr></Id><Ccy>${xml(ccy)}</Ccy>${meta.organization && meta.organization.name ? `<Ownr><Nm>${xml(meta.organization.name)}</Nm></Ownr>` : ''}</Acct>
+${balances}      <TxsSummry>
+        <TtlNtries><NbOfNtries>${nIn + nOut}</NbOfNtries></TtlNtries>
+        <TtlCdtNtries><NbOfNtries>${nIn}</NbOfNtries><Sum>${amt(st.inSum)}</Sum></TtlCdtNtries>
+        <TtlDbtNtries><NbOfNtries>${nOut}</NbOfNtries><Sum>${amt(st.outSum)}</Sum></TtlDbtNtries>
       </TxsSummry>
 ${entries.join('\n')}
     </Stmt>
@@ -256,8 +308,8 @@ function paymentOrders1C(payments, org, firstNumber = 1) {
     payments.forEach((p, i) => {
         lines.push(...oneCDocument({
             number: String(firstNumber + i), date: Date.now(), amount: p.amount,
-            payerAccount: org.account, payerName: org.name, payerInn: org.inn, payerBank: org.bank, payerBic: org.bic, payerCorr: org.corr,
-            payeeAccount: p.account, payeeName: p.name, payeeInn: p.inn, payeeBank: p.bank, payeeBic: p.bic, payeeCorr: p.corr,
+            payerAccount: org.account, payerName: org.name, payerInn: org.inn, payerKpp: org.kpp, payerBank: org.bank, payerBic: org.bic, payerCorr: org.corr,
+            payeeAccount: p.account, payeeName: p.name, payeeInn: p.inn, payeeKpp: p.kpp, payeeBank: p.bank, payeeBic: p.bic, payeeCorr: p.corr,
             purpose: p.purpose,
         }));
     });

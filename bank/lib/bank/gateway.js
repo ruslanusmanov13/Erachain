@@ -79,6 +79,36 @@ class Gateway {
             }
             if (o.account1C !== undefined) org.account1C = text(o.account1C, 40);
         }
+        // сопоставление счетов для 1С: актив → номер счёта (у каждого актива может быть свой «расчётный счёт»)
+        if (body.accounts1C && typeof body.accounts1C === 'object') {
+            const map = {};
+            for (const [asset, acc] of Object.entries(body.accounts1C)) {
+                const a = text(acc, 40).replace(/\s/g, '');
+                if (!a) continue;
+                if (!/^\d+$/.test(asset)) throw new BankError('Сопоставление счетов: номер актива — целое число');
+                map[asset] = a;
+            }
+            s.accounts1C = map;
+        }
+        // справочник контрагентов: адрес Erachain → наименование, ИНН, КПП, счёт и банк для выписок
+        if (Array.isArray(body.counterparties)) {
+            const list = [];
+            for (const c of body.counterparties.slice(0, 2000)) {
+                const address = text(c.address, 40);
+                if (!isAddress(address)) throw new BankError('Контрагент: неверный адрес ' + address);
+                const name = text(c.name, 160);
+                if (!name) throw new BankError('Контрагент ' + address + ': укажите наименование');
+                const item = { address, name, bank: text(c.bank, 160) };
+                const digits = { inn: [10, 12], kpp: [9], account: [20], bic: [9], corr: [20] };
+                for (const [k, lens] of Object.entries(digits)) {
+                    const v = text(c[k], 20).replace(/\s/g, '');
+                    if (v && (!/^\d+$/.test(v) || !lens.includes(v.length))) throw new BankError(`Контрагент ${name}: «${k}» — ${lens.join(' или ')} цифр`);
+                    item[k] = v;
+                }
+                list.push(item);
+            }
+            s.counterparties = list;
+        }
         this.store.save();
         return s;
     }

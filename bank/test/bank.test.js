@@ -142,9 +142,12 @@ test('демо: биржа — ордер исполняется встречн�
 });
 
 test('выписки: CSV, 1С (Windows-1251), camt.053', async (t) => {
-    const { call, accounts } = await startDemo(t);
+    const { call, accounts, backend } = await startDemo(t);
     const me = accounts[0].address;
     await call('POST', '/api/transfer', { from: me, to: B, asset: 1, amount: '5', title: 'Оплата №7' });
+    // неподтверждённая операция в выписку не попадает
+    assert.doesNotMatch((await call('GET', `/api/bank/statement?address=${me}&format=csv`)).data.toString('utf8'), /Оплата №7/);
+    backend.height += 1;
 
     const csv = await call('GET', `/api/bank/statement?address=${me}&format=csv`);
     assert.match(csv.headers.get('content-disposition'), /\.csv"/);
@@ -1278,4 +1281,51 @@ test('магазины: счёт продавца, заказ → оплата �
     assert.ok(r.data.some((a) => a.address === m.address && a.min === 1000), JSON.stringify(r.data));
     assert.ok(r.data.some((a) => a.label === 'Счёт выплат СБП') === false, 'у основного счёта COMPU хватает');
     assert.ok(!r.data.some((a) => a.label === 'Канал счетов на оплату'), 'канал только принимает — комиссия ему не нужна');
+});
+
+test('1С: остатки на начало и конец, КПП, справочник контрагентов, копейки и точные суммы, комиссия COMPU', async (t) => {
+    const ledger = require('../lib/bank/ledger');
+    const X = A;
+    const h = [
+        { timestamp: 500, from: X, to: B, asset: 1, amount: '10', fee: '0.0001', confirmations: 3, seqNo: '5-1' },
+        { timestamp: 300, from: B, to: X, asset: 1, amount: '0.12345678', fee: '0.0001', confirmations: 5, seqNo: '3-1', title: 'Приход' },
+        { timestamp: 250, from: B, to: X, asset: 1, amount: '1000', confirmations: 0 },
+        { timestamp: 200, from: X, to: B, asset: 1, amount: '5', fee: '0.0001', confirmations: 6, seqNo: '2-1', title: 'Оплата' },
+        { timestamp: 100, from: B, to: X, asset: 1, amount: '100', confirmations: 9 },
+    ];
+    const st = ledger.buildStatement({ history: h, address: X, asset: 1, from: 150, to: 400, current: '85.12345678' });
+    assert.deepStrictEqual([st.ops.length, ledger.fmt(st.opening), ledger.fmt(st.closing), ledger.fmt(st.inSum), ledger.fmt(st.outSum)],
+        [2, '100.00000000', '95.12345678', '0.12345678', '5.00000000']);
+    assert.strictEqual(ledger.buildStatement({ history: h, address: X, asset: 1, from: 150, to: 400, current: '1', limited: true }).opening, null);
+    // COMPU: комиссии сети — отдельные строки, остатки сходятся
+    const fees = ledger.buildStatement({ history: h, address: X, asset: 2, from: 0, to: 1000, current: '1.9998' });
+    assert.deepStrictEqual(fees.ops.map((o) => [o.isFee, o.exact]), [[true, '0.00010000'], [true, '0.00010000']]);
+    assert.strictEqual(ledger.fmt(fees.opening), '2.00000000');
+
+    const meta = {
+        address: X, assetName: 'ERA', from: 150, to: 400, account: '40702810000000000001',
+        organization: { name: 'ООО Ромашка', inn: '7701234567', kpp: '770101001' },
+        party: (a) => (a === B ? { name: 'ИП Петров', inn: '500100732259', account: '40802810000000000002', bank: 'Банк', bic: '044525225' } : null),
+    };
+    const text = new TextDecoder('windows-1251').decode(formats.statement1C(st, meta));
+    for (const re of [/РасчСчет=40702810000000000001/, /НачальныйОстаток=100\.00/, /ВсегоПоступило=0\.12/, /ВсегоСписано=5\.00/, /КонечныйОстаток=95\.12/,
+        /ПлательщикКПП=770101001/, /Получатель=ИП Петров/, /ПолучательИНН=500100732259/, /ПолучательСчет=40802810000000000002/, /Приход \(точно 0\.12345678 ERA\)/]) {
+        assert.match(text, re);
+    }
+    const camt = formats.camt053(st, { ...meta, scale: 8, currency: 'ERA' }).toString('utf8');
+    assert.match(camt, /<Cd>OPBD<\/Cd><\/CdOrPrtry><\/Tp>\s*<Amt Ccy="ERA">100\.00000000/);
+    assert.match(camt, /<Cd>CLBD<\/Cd><\/CdOrPrtry><\/Tp>\s*<Amt Ccy="ERA">95\.12345678/);
+    assert.match(camt, /<Nm>ИП Петров<\/Nm><Id><OrgId><Othr><Id>500100732259/);
+
+    // через API: настройки сопоставления счетов и контрагентов
+    const { call, accounts, backend } = await startDemo(t);
+    const me = accounts[0].address;
+    assert.strictEqual((await call('PUT', '/api/bank/settings', { counterparties: [{ address: B, name: 'X', inn: '12' }] })).status, 400);
+    assert.strictEqual((await call('PUT', '/api/bank/settings', { accounts1C: { 1: '40702810000000000077' }, counterparties: [{ address: B, name: 'ИП Петров', inn: '500100732259' }] })).status, 200);
+    await call('POST', '/api/transfer', { from: me, to: B, asset: 1, amount: '0.5', title: 'Тест' });
+    backend.height += 1;
+    const r = new TextDecoder('windows-1251').decode((await call('GET', `/api/bank/statement?address=${me}&format=1c&asset=1`)).data);
+    assert.match(r, /РасчСчет=40702810000000000077/);
+    assert.match(r, /НачальныйОстаток=0\.00[\s\S]*ВсегоПоступило=1250\.50[\s\S]*ВсегоСписано=0\.50[\s\S]*КонечныйОстаток=1250\.00/);
+    assert.match(r, /Получатель=ИП Петров/);
 });
