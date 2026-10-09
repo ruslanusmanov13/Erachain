@@ -80,7 +80,7 @@ class DemoBackend {
         this.orders.push(this.makeOrder(external, 2, 1, '3', '62'));
 
         this.timer = setInterval(() => { this.height += 1; }, blockMs);
-        this.timer.unref();
+        if (this.timer.unref) this.timer.unref(); // в браузере (демо-страница) unref нет
     }
 
     // ---------- служебное ----------

@@ -82,6 +82,8 @@ export async function download(method, path, body) {
 }
 
 export async function saveFile(filename, base64, mime) {
+    // встраивающая страница (например, демо) может показать файл вместо скачивания
+    if (typeof window.bankSaveFileHook === 'function') return window.bankSaveFileHook(filename, base64, mime);
     const plugins = window.Capacitor && window.Capacitor.Plugins;
     if (isNative() && plugins && plugins.Filesystem && plugins.Share) {
         // Android: сохраняем во временную папку и открываем «Поделиться» (почта, 1С, диск, мессенджеры)
