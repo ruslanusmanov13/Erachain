@@ -295,7 +295,7 @@ test('NodeBackend: вызовы RPC ноды и разбор ответов', as
     t.after(() => node.close());
     const b = new NodeBackend(rpc);
 
-    assert.deepStrictEqual(await b.status(), { mode: 'node', node: rpc, height: 12345, version: '6.1.01' });
+    assert.deepStrictEqual(await b.status(), { mode: 'node', node: rpc, fallback: false, height: 12345, version: '6.1.01' });
     await assert.rejects(b.login('bad-password'), /wallet is locked/);
     assert.deepStrictEqual(await b.accounts('secret123'), [{ address: A, balances: [{ asset: 1, name: 'ERA', amount: '7.5', debt: '1', hold: '0', spend: '0' }] }]);
 
