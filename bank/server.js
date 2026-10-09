@@ -16,6 +16,7 @@ const { Invoices } = require('./lib/invoices');
 const { Loans } = require('./lib/loans');
 const { Merchants } = require('./lib/merchants');
 const { MarketMaker } = require('./lib/marketmaker');
+const { Anchors, canonical } = require('./lib/anchors');
 const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Decode, base58Encode } = require('./lib/seed');
 const { deriveAccounts } = require('./lib/erakeys');
 const { Clients } = require('./lib/clients');
@@ -81,6 +82,35 @@ function createApp(backend, options = {}) {
     }
     // курсы (7Pay, стакан биржи, ручной) и маркет-мейкер на бирже Erachain
     const mm = new MarketMaker(backend, store, { sevenpay: options.sevenpay || null });
+    // отчёты банка: сутки → файл у банка + SHA-256 в блокчейне, цепочка хешей
+    const inPeriod = (from, to) => (x) => (x.createdAt || x.ts || 0) >= from && (x.createdAt || x.ts || 0) < to;
+    const anchors = new Anchors(backend, store, async (from, to, password) => {
+        const d = store.data;
+        const take = (list) => (list || []).filter(inPeriod(from, to));
+        const foreign = new Set(d.clients.flatMap((c) => clients.addresses(c)));
+        const accounts = (await backend.accounts(password)).filter((a) => !foreign.has(a.address))
+            .map((a) => ({ address: a.address, balances: a.balances.map((b) => ({ asset: b.asset, amount: String(b.amount) })) }));
+        const sbpOrders = take(d.sbpOrders).map((o) => ({ id: o.id, amountKop: o.amountKop, status: o.status, receiver: o.receiver, asset: o.asset, amount: o.amountChain ?? null, txId: o.txId || null }));
+        const issued = take(d.invoicesIssued).map((i) => ({ signature: i.signature, order: i.order, shop: i.shop, sum: i.sum, curr: i.curr, status: i.status, paidSum: i.paidSum || 0 }));
+        const paid = take(d.invoicesPaid).map((i) => ({ id: i.id, invoice: i.invoice, from: i.from, amount: i.amount, asset: i.asset, status: i.status, txId: i.txId || null }));
+        const deliveries = (d.invoicesIssued || []).filter((i) => i.deliver && i.deliver.deliveredAt >= from && i.deliver.deliveredAt < to)
+            .map((i) => ({ invoice: i.signature, to: i.deliver.to, asset: i.deliver.asset, amount: i.deliver.amount, txId: i.deliver.txId }));
+        const fills = (d.mmOrders || []).flatMap((o) => (o.fills || []).filter((f) => f.at >= from && f.at < to).map((f) => ({ pair: o.pairId, side: o.side, price: o.price, base: f.base })));
+        const deposits = take(d.deposits).map((x) => ({ id: x.id, amount: x.amount, status: x.status, address: x.address || null, txId: x.txId || null }));
+        const withdrawals = (d.withdrawals || []).filter((x) => (x.timestamp || x.createdAt || 0) >= from && (x.timestamp || x.createdAt || 0) < to)
+            .map((x) => ({ signature: x.signature, amount: x.amount, status: x.status }));
+        const audit = (d.audit || []).filter((x) => x.ts >= from && x.ts < to);
+        return {
+            bank: { gatewayAccount: (d.settings || {}).gatewayAccount || null, organization: ((d.settings || {}).organization || {}).name || null },
+            balancesAt: Date.now(), accounts, sbpOrders, invoicesIssued: issued, invoicesPaid: paid, deliveries, marketMaker: fills, deposits, withdrawals,
+            audit: { count: audit.length, hash: base58Encode(crypto.createHash('sha256').update(canonical(audit)).digest()) },
+            summary: {
+                accounts: accounts.length, sbp: sbpOrders.length, sbpDone: sbpOrders.filter((o) => o.status === 'ERA_DONE').length,
+                invoicesIssued: issued.length, invoicesPaid: paid.length, deliveries: deliveries.length, trades: fills.length,
+                deposits: deposits.length, withdrawals: withdrawals.length, audit: audit.length,
+            },
+        };
+    });
     // обменник 7Pay: options.sevenpay — клиент API (SevenPayClient или SevenPayDemo); без него раздел выключен
     const swap = options.sevenpay ? new SwapService(options.sevenpay, backend, store) : null;
     const requireSwap = () => {
@@ -112,6 +142,8 @@ function createApp(backend, options = {}) {
                     mm.lastTick = Date.now();
                     await mm.tick(staff.walletPassword({ password: null }));
                 }
+                // отчёты: по расписанию за прошедшие сутки, хеш — в блокчейн
+                if (staff.shift && anchors.settings().enabled) await anchors.tick(staff.walletPassword({ password: null }));
                 // магазины: выдача товара по оплаченным заказам
                 if (staff.shift && store.data.invoicesIssued.some((i) => i.deliver && !['delivered', 'expired', 'cancelled', 'error'].includes(i.deliver.state))) {
                     await merchants.deliveries(staff.walletPassword({ password: null }));
@@ -202,6 +234,10 @@ function createApp(backend, options = {}) {
             if (method === 'GET' || ['/api/invoices/find', '/api/invoices/check', '/api/invoices/prepare', '/api/invoices/paid-signed'].includes(pathname)) return ['read'];
             if (pathname === '/api/invoices/cleanup') return ['settings'];
             return pathname === '/api/invoices/settings' ? ['settings'] : ['sign'];
+        }
+        if (pathname.startsWith('/api/reports')) {
+            if (method === 'GET' || pathname === '/api/reports/verify') return ['statements'];
+            return pathname === '/api/reports/settings' ? ['settings'] : ['statements', 'sign'];
         }
         if (pathname.startsWith('/api/mm') || pathname === '/api/rates') {
             if (method === 'GET') return ['read'];
@@ -829,6 +865,27 @@ function createApp(backend, options = {}) {
         ['POST', /^\/api\/invoices\/([1-9A-HJ-NP-Za-km-z]{60,100})\/cancel$/, ({ m, session }) => invoices.cancel(m[1], session.password)],
         ['POST', '/api/invoices/cleanup', async ({ req, session }) => invoices.cleanup(session.password, await readJson(req))],
         ['GET', '/api/invoices/paid', () => invoices.paidList()],
+
+        // отчёты банка с фиксацией хеша в блокчейне
+        ['GET', '/api/reports', () => ({ settings: anchors.settings(), reports: anchors.list() })],
+        ['PUT', '/api/reports/settings', async ({ req }) => anchors.updateSettings(await readJson(req))],
+        ['POST', '/api/reports/run', async ({ req, session }) => {
+            const body = await readJson(req);
+            const date = v.text(body.date, 10) || anchors.localDate(Date.now() - 86400000);
+            const r = await anchors.run(date, session.password, { force: !!body.force });
+            const { report, ...rest } = r;
+            return rest;
+        }],
+        ['POST', '/api/reports/tick', async ({ session }) => (await anchors.tick(session.password)).map(({ report, ...r }) => r)],
+        ['POST', '/api/reports/verify', async ({ req }) => {
+            const body = await readJson(req);
+            const content = body.base64 ? Buffer.from(String(body.base64), 'base64').toString('utf8') : body.report;
+            return anchors.verify(content);
+        }],
+        ['GET', /^\/api\/reports\/([0-9a-f]+)\/file$/, ({ m }) => {
+            const f = anchors.file(m[1]);
+            return file(f.filename, 'application/json', f.content);
+        }],
 
         // курсы и маркет-мейкер
         ['GET', '/api/rates', async ({ url, session }) => {

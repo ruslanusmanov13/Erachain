@@ -1,6 +1,7 @@
 import { get, post, put, patch, download } from '../api.js';
 import { el, card, field, input, select, form, tabs, fmt, short, date, kv, empty, spinner, toast, confirm, badge, pickFile, fileToBase64, openDialog, closeDialog } from '../ui.js';
 import { state, accountSelect, loadAccounts } from '../state.js';
+import { reportsView } from './reports.js';
 
 const DEPOSIT_STATUS = {
     new: ['к зачислению', 'warn'], review: ['нет адреса', 'bad'], processing: ['зачисляется…', 'warn'],
@@ -265,7 +266,7 @@ export default {
     async render(params) {
         // кабинет по ключу счёта: только выписки своего счёта
         if (state.me && ['account', 'client', 'wallet'].includes(state.me.user.role)) return statements();
-        const views = { statements, deposits, withdrawals, settings: gatewaySettings };
+        const views = { statements, deposits, withdrawals, reports: reportsView, settings: gatewaySettings };
         let mode = params[0] === 'gateway' ? 'deposits' : params[0];
         if (!views[mode]) mode = 'statements';
         const body = el('div', {}, spinner());
@@ -287,6 +288,6 @@ export default {
         const shopLink = el('a', { class: 'menu-tile sbp-link', href: '#/shops' },
             el('b', {}, 'Магазины →'), el('span', { class: 'muted' }, 'Счета продавцов, товары-активы, выдача покупателю после оплаты, контроль COMPU'));
         return el('div', { class: 'stack' }, el('div', { class: 'grid-2' }, sbpLink, invLink, shopLink, loanLink),
-            el('div', {}, tabs([['statements', 'Выписки'], ['deposits', 'Поступления'], ['withdrawals', 'Вывод'], ['settings', 'Шлюз']], mode, show), body));
+            el('div', {}, tabs([['statements', 'Выписки'], ['deposits', 'Поступления'], ['withdrawals', 'Вывод'], ['reports', 'Отчёты'], ['settings', 'Шлюз']], mode, show), body));
     },
 };

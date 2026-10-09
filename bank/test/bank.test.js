@@ -1387,3 +1387,51 @@ test('курсы и маркет-мейкер: медиана источнико
     assert.strictEqual((await api('POST', '/api/mm/tick', {}, vt)).status, 403);
     assert.strictEqual((await api('PUT', '/api/mm/settings', { maxSourceDeviationPct: 50 }, vt)).status, 403);
 });
+
+test('отчёты: сутки → хеш в блокчейне, расписание, подтверждение, цепочка, проверка файла и подделки', async (t) => {
+    const { api, call, accounts, backend } = await startDemo(t);
+    const main = accounts[0].address;
+    assert.strictEqual((await call('PUT', '/api/reports/settings', { enabled: true })).status, 400, 'без счёта не включить');
+    assert.strictEqual((await call('PUT', '/api/reports/settings', { enabled: true, account: main, time: '25:00' })).status, 400);
+    assert.strictEqual((await call('PUT', '/api/reports/settings', { enabled: true, account: main, time: '00:10' })).status, 200);
+    // расписание: первый запуск — отчёт за последние закончившиеся сутки
+    let r = await call('POST', '/api/reports/tick');
+    assert.strictEqual(r.data.length, 1, JSON.stringify(r.data));
+    const first = r.data[0];
+    assert.strictEqual(first.status, 'anchored');
+    assert.ok(first.signature);
+    assert.strictEqual((await call('POST', '/api/reports/tick')).data.length, 0, 'повторно за те же сутки не собирается');
+    backend.height += 1;
+    await call('POST', '/api/reports/tick');
+    let list = (await call('GET', '/api/reports')).data.reports;
+    assert.strictEqual(list[0].status, 'confirmed');
+    // хеш отчёта записан в блокчейн документом
+    const onChain = await backend.verifyDocument(first.hash);
+    assert.strictEqual(onChain.length, 1);
+    assert.strictEqual(onChain[0].creator, main);
+
+    // ручной отчёт за другие сутки: цепочка — ссылается на предыдущий
+    r = await call('POST', '/api/reports/run', { date: '2026-01-15' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual(r.data.prevHash, first.hash);
+    assert.strictEqual((await call('POST', '/api/reports/run', { date: '2099-01-01' })).status, 400, 'сутки ещё не закончились');
+
+    // файл отчёта проверяется по блокчейну; подделка — нет
+    const f = await call('GET', `/api/reports/${first.id}/file`);
+    assert.match(f.headers.get('content-disposition'), /report-\d{4}-\d\d-\d\d\.json/);
+    const report = f.data;
+    const text = JSON.stringify(report, null, 2);
+    assert.strictEqual(report.type, 'erachain-bank-report');
+    assert.ok(report.accounts.some((a) => a.address === main));
+    let v = await call('POST', '/api/reports/verify', { base64: Buffer.from(text).toString('base64') });
+    assert.deepStrictEqual([v.data.hash, v.data.anchored, v.data.known], [first.hash, true, true]);
+    report.accounts[0].balances[0].amount = '999999';
+    v = await call('POST', '/api/reports/verify', { report });
+    assert.deepStrictEqual([v.data.anchored, v.data.known, v.data.changed], [false, false, true]);
+    // права: наблюдателю отчёты не видны
+    await call('POST', '/api/staff', { login: 'viewer2', role: 'viewer', password: 'viewer123' });
+    const vt = (await api('POST', '/api/login', { login: 'viewer2', password: 'viewer123' })).data.token;
+    assert.strictEqual((await api('GET', '/api/reports', null, vt)).status, 403);
+    list = (await call('GET', '/api/reports')).data.reports;
+    assert.ok(!('report' in list[0]), 'список без содержимого');
+});
