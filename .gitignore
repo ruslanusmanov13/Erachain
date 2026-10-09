@@ -27,4 +27,6 @@ gui_settings.json
 *.log
 
 # mac
-*.DS_Store
+*.DS_Store# bank app
+/bank/data/
+/bank/node_modules/

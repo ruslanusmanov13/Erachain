@@ -1,26 +1,41 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { NodeBackend } = require('./lib/nodeBackend');
 const { DemoBackend } = require('./lib/demoBackend');
-const { isAddress, validateTransfer, BankError } = require('./lib/validate');
+const { JsonStore } = require('./lib/store');
+const { Gateway } = require('./lib/bank/gateway');
+const formats = require('./lib/bank/formats');
+const v = require('./lib/validate');
 
+const { BankError } = v;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const SESSION_TTL_MS = 15 * 60 * 1000;
+const MAX_BODY = 8 * 1024 * 1024; // выписки банка могут быть большими
 const MIME = {
     '.html': 'text/html; charset=utf-8',
     '.js': 'text/javascript; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
     '.svg': 'image/svg+xml',
+    '.png': 'image/png',
     '.ico': 'image/x-icon',
+    '.json': 'application/json',
+    '.webmanifest': 'application/manifest+json',
 };
 
-function createApp(backend) {
-    // token -> { password, expires }; пароль кошелька хранится только в памяти сервера
-    const sessions = new Map();
+/**
+ * options.store — хранилище данных шлюза (JsonStore), options.webhookSecret — секрет вебхука банка,
+ * options.corsOrigins — список origin, которым разрешены запросы (для веб-версии на другом домене).
+ */
+function createApp(backend, options = {}) {
+    const sessions = new Map(); // token -> { password, expires }; пароль только в памяти сервера
+    const failures = new Map(); // ip -> { count, until } — защита от подбора пароля
+    const gateway = new Gateway(backend, options.store || new JsonStore(null, {}));
+    const corsOrigins = new Set(options.corsOrigins || []);
 
     function openSession(password) {
         const token = crypto.randomBytes(24).toString('hex');
@@ -40,57 +55,185 @@ function createApp(backend) {
         return { token, password: s.password };
     }
 
-    async function readJson(req) {
+    function checkThrottle(ip) {
+        const f = failures.get(ip);
+        if (f && f.until > Date.now()) {
+            throw new BankError(`Слишком много попыток входа. Повторите через ${Math.ceil((f.until - Date.now()) / 1000)} с`, 429);
+        }
+    }
+
+    function loginFailed(ip) {
+        const f = failures.get(ip) || { count: 0, until: 0 };
+        f.count += 1;
+        if (f.count >= 5) f.until = Date.now() + Math.min(2 ** (f.count - 5) * 30000, 3600000);
+        failures.set(ip, f);
+    }
+
+    async function readRaw(req) {
         let size = 0;
         const chunks = [];
         for await (const chunk of req) {
             size += chunk.length;
-            if (size > 64 * 1024) throw new BankError('Слишком большой запрос', 413);
+            if (size > MAX_BODY) throw new BankError('Слишком большой запрос', 413);
             chunks.push(chunk);
         }
-        if (!chunks.length) return {};
+        return Buffer.concat(chunks);
+    }
+
+    async function readJson(req) {
+        const raw = await readRaw(req);
+        if (!raw.length) return {};
         try {
-            return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            return JSON.parse(raw.toString('utf8'));
         } catch (e) {
             throw new BankError('Некорректный JSON');
         }
     }
 
-    async function api(req, res, url) {
-        const route = req.method + ' ' + url.pathname;
+    function file(filename, mime, content) {
+        return { file: true, filename, mime, content };
+    }
 
-        if (route === 'GET /api/status') return backend.status();
+    async function statement(url, session) {
+        const address = url.searchParams.get('address');
+        if (!v.isAddress(address)) throw new BankError('Неверный адрес');
+        const asset = url.searchParams.get('asset') ? Number(url.searchParams.get('asset')) : null;
+        const from = url.searchParams.get('from') ? Date.parse(url.searchParams.get('from')) : 0;
+        const toRaw = url.searchParams.get('to') ? Date.parse(url.searchParams.get('to')) : Date.now();
+        const to = toRaw + (url.searchParams.get('to') ? 86400000 - 1 : 0); // до конца дня
+        if (!Number.isFinite(from) || !Number.isFinite(to)) throw new BankError('Неверный период');
+        const format = url.searchParams.get('format') || 'csv';
+        const ops = (await backend.history(address, 200, session.password))
+            .filter((o) => (o.timestamp || 0) >= from && (o.timestamp || 0) <= to)
+            .filter((o) => asset === null || Number(o.asset) === asset);
+        const assetName = asset === null ? '' : (ops.find((o) => o.assetName) || {}).assetName || '#' + asset;
+        const s = gateway.settings();
+        const meta = {
+            address, assetName, from: from || (ops.length ? ops[ops.length - 1].timestamp : Date.now()), to: Math.min(to, Date.now()),
+            organization: s.organization, currency: asset !== null && asset === s.tokenAsset ? s.currency : (assetName || 'XXX').slice(0, 3).toUpperCase(),
+            scale: asset !== null && asset === s.tokenAsset ? 2 : 8,
+        };
+        const base = `statement-${address.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}`;
+        if (format === '1c') return file(base + '.1c.txt', 'text/plain; charset=windows-1251', formats.statement1C(ops, meta));
+        if (format === 'camt053') return file(base + '.camt053.xml', 'application/xml', formats.camt053(ops, meta));
+        if (format === 'csv') return file(base + '.csv', 'text/csv; charset=utf-8', formats.statementCsv(ops, meta));
+        throw new BankError('Формат: csv, 1c или camt053');
+    }
 
-        if (route === 'POST /api/login') {
+    // [метод, путь (строка или RegExp), обработчик(ctx) , { public: true } для методов без сессии]
+    const routes = [
+        ['GET', '/api/status', () => backend.status(), { public: true }],
+        ['POST', '/api/login', async ({ req, ip }) => {
+            checkThrottle(ip);
             const { password } = await readJson(req);
             if (typeof password !== 'string' || !password) throw new BankError('Введите пароль кошелька');
-            await backend.login(password);
+            try {
+                await backend.login(password);
+            } catch (e) {
+                loginFailed(ip);
+                throw e.status === 502 ? e : new BankError('Неверный пароль кошелька', 401);
+            }
+            failures.delete(ip);
             return { token: openSession(password) };
-        }
+        }, { public: true }],
+        ['POST', '/api/bank/webhook', async ({ req }) => {
+            const raw = await readRaw(req);
+            return gateway.webhook(raw, req.headers['x-signature'], options.webhookSecret);
+        }, { public: true }],
 
-        const session = requireSession(req);
-
-        if (route === 'POST /api/logout') {
+        ['POST', '/api/logout', ({ session }) => {
             sessions.delete(session.token);
             return { ok: true };
-        }
-        if (route === 'GET /api/accounts') return backend.accounts(session.password);
-        if (route === 'POST /api/accounts') return backend.openAccount(session.password);
+        }],
+        ['GET', '/api/network', () => backend.network()],
 
-        const hist = url.pathname.match(/^\/api\/accounts\/([^/]+)\/history$/);
-        if (req.method === 'GET' && hist) {
-            const address = decodeURIComponent(hist[1]);
-            if (!isAddress(address)) throw new BankError('Неверный адрес');
+        // счета и переводы
+        ['GET', '/api/accounts', ({ session }) => backend.accounts(session.password)],
+        ['POST', '/api/accounts', ({ session }) => backend.openAccount(session.password)],
+        ['GET', /^\/api\/accounts\/([^/]+)\/history$/, ({ m, url, session }) => {
+            const address = decodeURIComponent(m[1]);
+            if (!v.isAddress(address)) throw new BankError('Неверный адрес');
             const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit'), 10) || 50, 1), 200);
-            return backend.history(address, limit);
-        }
+            return backend.history(address, limit, session.password);
+        }],
+        ['POST', '/api/transfer', async ({ req, session }) => backend.transfer(v.validateTransfer(await readJson(req)), session.password)],
+        ['POST', '/api/transfer/batch', async ({ req, session }) => backend.multiTransfer(v.validateMultiTransfer(await readJson(req)), session.password)],
 
-        if (route === 'POST /api/transfer') {
-            const transfer = validateTransfer(await readJson(req));
-            return backend.transfer(transfer, session.password);
-        }
+        // активы
+        ['GET', '/api/assets/types', () => backend.assetTypes()],
+        ['GET', '/api/assets', ({ url }) => backend.assets(Number(url.searchParams.get('from')) || 0)],
+        ['GET', /^\/api\/assets\/(\d+)$/, ({ m }) => backend.asset(Number(m[1]))],
+        ['POST', '/api/assets', async ({ req, session }) => backend.issueAsset(v.validateAssetIssue(await readJson(req)), session.password)],
 
-        throw new BankError('Метод не найден', 404);
+        // голосования
+        ['GET', '/api/polls', ({ url }) => backend.polls(Number(url.searchParams.get('from')) || 0)],
+        ['GET', /^\/api\/polls\/(\d+)$/, ({ m, url }) => backend.poll(Number(m[1]), Number(url.searchParams.get('asset')) || 1)],
+        ['POST', '/api/polls', async ({ req, session }) => backend.createPoll(v.validatePoll(await readJson(req)), session.password)],
+        ['POST', /^\/api\/polls\/(\d+)\/vote$/, async ({ req, m, session }) => backend.vote(v.validateVote(await readJson(req), m[1]), session.password)],
+
+        // биржа
+        ['GET', /^\/api\/exchange\/(\d+)\/(\d+)$/, async ({ m }) => {
+            const [book, trades] = await Promise.all([backend.orderBook(+m[1], +m[2]), backend.trades(+m[1], +m[2])]);
+            return { ...book, trades };
+        }],
+        ['GET', /^\/api\/exchange\/orders\/([^/]+)$/, ({ m }) => {
+            const address = decodeURIComponent(m[1]);
+            if (!v.isAddress(address)) throw new BankError('Неверный адрес');
+            return backend.myOrders(address);
+        }],
+        ['POST', '/api/exchange/orders', async ({ req, session }) => backend.createOrder(v.validateOrder(await readJson(req)), session.password)],
+        ['POST', '/api/exchange/cancel', async ({ req, session }) => backend.cancelOrder(v.validateCancel(await readJson(req)), session.password)],
+
+        // сообщения
+        ['GET', /^\/api\/messages\/([^/]+)$/, ({ m }) => {
+            const address = decodeURIComponent(m[1]);
+            if (!v.isAddress(address)) throw new BankError('Неверный адрес');
+            return backend.messages(address);
+        }],
+        ['POST', '/api/messages', async ({ req, session }) => backend.sendMessage(v.validateMessage(await readJson(req)), session.password)],
+
+        // документы
+        ['POST', '/api/documents', async ({ req, session }) => backend.signDocument(v.validateDocument(await readJson(req)), session.password)],
+        ['GET', /^\/api\/documents\/verify\/([1-9A-HJ-NP-Za-km-z]{40,46})$/, ({ m }) => backend.verifyDocument(m[1])],
+
+        // персоны и справочники
+        ['GET', '/api/persons', ({ url }) => backend.persons(Number(url.searchParams.get('from')) || 0)],
+        ['GET', /^\/api\/persons\/(\d+)$/, ({ m }) => backend.person(Number(m[1]))],
+        ['POST', '/api/persons', async ({ req, session }) => backend.issuePerson(v.validatePersonIssue(await readJson(req)), session.password)],
+        ['POST', '/api/persons/certify', async ({ req, session }) => backend.certifyPerson(v.validateCertify(await readJson(req)), session.password)],
+        ['GET', /^\/api\/catalog\/(statuses|templates)$/, ({ m, url }) => backend.catalog(m[1], Number(url.searchParams.get('from')) || 0)],
+
+        // банковская интеграция
+        ['GET', '/api/bank/statement', ({ url, session }) => statement(url, session)],
+        ['GET', '/api/bank/settings', () => gateway.settings()],
+        ['PUT', '/api/bank/settings', async ({ req }) => gateway.updateSettings(await readJson(req))],
+        ['GET', '/api/bank/deposits', () => gateway.deposits()],
+        ['POST', '/api/bank/import', async ({ req }) => {
+            const body = await readJson(req);
+            if (typeof body.content !== 'string') throw new BankError('Файл не передан');
+            return gateway.importStatement(Buffer.from(body.content, 'base64'));
+        }],
+        ['PATCH', /^\/api\/bank\/deposits\/([\w-]+)$/, async ({ req, m }) => gateway.updateDeposit(m[1], await readJson(req))],
+        ['POST', /^\/api\/bank\/deposits\/([\w-]+)\/credit$/, ({ m, session }) => gateway.creditDeposit(m[1], session.password)],
+        ['GET', '/api/bank/withdrawals', () => gateway.withdrawals()],
+        ['POST', '/api/bank/withdrawals/scan', () => gateway.scanWithdrawals()],
+        ['POST', '/api/bank/withdrawals/export', async ({ req }) => {
+            const body = await readJson(req);
+            const r = gateway.exportPayments(Array.isArray(body.ids) ? body.ids : null, body.format === 'pain001' ? 'pain001' : '1c');
+            return file(r.filename, r.mime, r.content);
+        }],
+        ['POST', /^\/api\/bank\/withdrawals\/([\w-]+)\/paid$/, ({ m }) => gateway.markPaid(m[1])],
+        ['POST', /^\/api\/bank\/withdrawals\/([\w-]+)\/refund$/, ({ m, session }) => gateway.refund(m[1], session.password)],
+    ];
+
+    function route(method, pathname) {
+        for (const [meth, pattern, handler, opts = {}] of routes) {
+            if (meth !== method) continue;
+            if (typeof pattern === 'string' ? pattern === pathname : pattern.test(pathname)) {
+                return { handler, opts, m: typeof pattern === 'string' ? null : pathname.match(pattern) };
+            }
+        }
+        return null;
     }
 
     function serveStatic(req, res, url) {
@@ -108,28 +251,78 @@ function createApp(backend) {
             res.writeHead(200, {
                 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
                 'X-Content-Type-Options': 'nosniff',
+                'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'",
             }).end(data);
         });
     }
 
-    return http.createServer(async (req, res) => {
+    function corsHeaders(req) {
+        const origin = req.headers.origin;
+        if (!origin || !corsOrigins.has(origin)) return {};
+        return {
+            'Access-Control-Allow-Origin': origin,
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, OPTIONS',
+            'Access-Control-Expose-Headers': 'Content-Disposition',
+            Vary: 'Origin',
+        };
+    }
+
+    return async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
         if (!url.pathname.startsWith('/api/')) {
             serveStatic(req, res, url);
             return;
         }
+        const cors = corsHeaders(req);
+        if (req.method === 'OPTIONS') {
+            res.writeHead(204, cors).end();
+            return;
+        }
         let status = 200;
         let body;
         try {
-            body = await api(req, res, url);
+            const r = route(req.method, url.pathname);
+            if (!r) throw new BankError('Метод не найден', 404);
+            const session = r.opts.public ? null : requireSession(req);
+            const ip = req.socket.remoteAddress || '';
+            body = await r.handler({ req, url, m: r.m, session, ip });
         } catch (e) {
             status = e instanceof BankError ? e.status : 500;
             body = { error: e instanceof BankError ? e.message : 'Внутренняя ошибка сервера' };
             if (!(e instanceof BankError)) console.error(e);
         }
-        res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        if (body && body.file) {
+            res.writeHead(200, {
+                ...cors,
+                'Content-Type': body.mime,
+                'Content-Disposition': `attachment; filename="${body.filename}"`,
+                'Cache-Control': 'no-store',
+            });
+            res.end(body.content);
+            return;
+        }
+        res.writeHead(status, { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify(body));
-    });
+    };
+}
+
+function demoGatewaySettings(backend) {
+    return {
+        tokenAsset: 1048,
+        gatewayAccount: backend.gatewayAccount,
+        currency: 'RUB',
+        organization: {
+            name: 'ООО «Демо Шлюз»', inn: '7701234567', kpp: '770101001', account: '40702810900000012345',
+            bank: 'ПАО Демобанк', bic: '044525999', corr: '30101810400000000999', account1C: '',
+        },
+    };
+}
+
+function createServer(backend, options = {}) {
+    const handler = createApp(backend, options);
+    if (options.tls) return https.createServer(options.tls, handler);
+    return http.createServer(handler);
 }
 
 if (require.main === module) {
@@ -137,11 +330,27 @@ if (require.main === module) {
     const port = Number(process.env.PORT || 8080);
     const host = process.env.HOST || '127.0.0.1';
     const rpc = process.env.ERA_RPC || 'http://127.0.0.1:9048';
+    const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
     const backend = demo ? new DemoBackend() : new NodeBackend(rpc);
-    createApp(backend).listen(port, host, () => {
-        console.log(`Банк Erachain: http://${host}:${port}`);
+    const tls = process.env.TLS_CERT && process.env.TLS_KEY
+        ? { cert: fs.readFileSync(process.env.TLS_CERT), key: fs.readFileSync(process.env.TLS_KEY) }
+        : null;
+    const server = createServer(backend, {
+        tls,
+        // в демо адреса случайные при каждом запуске, поэтому данные шлюза хранятся только в памяти
+        store: demo
+            ? new JsonStore(null, { settings: demoGatewaySettings(backend) })
+            : new JsonStore(path.join(dataDir, 'gateway.json'), {}),
+        webhookSecret: process.env.BANK_WEBHOOK_SECRET || '',
+        corsOrigins: (process.env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
+    });
+    server.listen(port, host, () => {
+        console.log(`Банк Erachain: ${tls ? 'https' : 'http'}://${host}:${port}`);
         console.log(demo ? 'Демо-режим, пароль кошелька: demo12345' : 'RPC ноды: ' + rpc);
+        if (host !== '127.0.0.1' && host !== 'localhost' && !tls) {
+            console.warn('Внимание: сервер доступен из сети без HTTPS — задайте TLS_CERT и TLS_KEY или поставьте его за HTTPS-прокси.');
+        }
     });
 }
 
-module.exports = { createApp };
+module.exports = { createApp, createServer, demoGatewaySettings };
