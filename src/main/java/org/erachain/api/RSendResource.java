@@ -51,8 +51,8 @@ public class RSendResource {
     @GET
     public String help() {
         Map<String, String> help = new LinkedHashMap<String, String>();
-        help.put("GET r_send/{creator}/{recipient}?feePow={feePow}&assetKey={assetKey}&amount={amount}&title={title}&message={message}&encoding={encoding}&encrypt=true&password={password}",
-                "make and broadcast SEND asset amount and mail");
+        help.put("GET r_send/{creator}/{recipient}?feePow={feePow}&assetKey={assetKey}&amount={amount}&title={title}&message={message}&encoding={encoding}&encrypt=true&backward=false&password={password}",
+                "make and broadcast SEND asset amount and mail. Negative assetKey - debt: lend or repay; with backward=true - confiscate debt");
         help.put("POST r_send/{creator}/{recipient} {feePowfeePow}&assetKey={assetKey}&amount={amount}&title={title}&encoding={encoding}&encrypt=true&password={password} (message)",
                 "make and broadcast SEND asset amount and mail in body");
         help.put("GET r_send/raw/{creator}/{recipient}?linkTo=<SeqNo>&feePow={feePow}&assetKey={assetKey}&amount={amount}&title={title}&message={message}&encoding={encoding}&encrypt=true&password={password}",
@@ -106,7 +106,8 @@ public class RSendResource {
                           @QueryParam("amount") BigDecimal amount, @QueryParam("title") String title,
                           @QueryParam("message") String message,
                           @QueryParam("encoding") int encoding,
-                          @QueryParam("encrypt") boolean encrypt, @QueryParam("password") String password) {
+                          @QueryParam("encrypt") boolean encrypt, @QueryParam("password") String password,
+                          @QueryParam("backward") boolean backward) {
 
         APIUtils.askAPICallAllowed(password, "GET send\n ", request, true);
 
@@ -124,7 +125,7 @@ public class RSendResource {
         Pair<Integer, Transaction> result = cntr.make_R_Send(creatorStr, null, exLink, null, recipientStr, feePowStr,
                 assetKey, true,
                 amount, needAmount,
-                title, message, encoding, encrypt, 0);
+                title, message, encoding, encrypt, 0, backward);
 
         Transaction transaction = result.getB();
         if (transaction == null) {
@@ -155,7 +156,7 @@ public class RSendResource {
                            @QueryParam("encoding") int encoding,
                            @QueryParam("encrypt") boolean encrypt, @QueryParam("password") String password) {
 
-        return sendGet(creatorStr, recipientStr, exLinkRef, feePowStr, assetKey, amount, title, message, encoding, encrypt, password);
+        return sendGet(creatorStr, recipientStr, exLinkRef, feePowStr, assetKey, amount, title, message, encoding, encrypt, password, false);
 
     }
 
@@ -201,7 +202,8 @@ public class RSendResource {
 
         String creator = (String) jsonObject.getOrDefault("creator", null);
         String recipient = (String) jsonObject.getOrDefault("recipient", null);
-        String linkToRefStr = jsonObject.get("linkTo").toString();
+        Object linkToObj = jsonObject.get("linkTo");
+        String linkToRefStr = linkToObj == null ? null : linkToObj.toString();
         Long linkToRef;
         if (linkToRefStr == null)
             linkToRef = null;
@@ -221,6 +223,7 @@ public class RSendResource {
         int encoding = Integer.valueOf(jsonObject.getOrDefault("encoding", 0).toString());
         boolean encrypt = Boolean.valueOf((boolean) jsonObject.getOrDefault("encrypt", false));
         String password = (String) jsonObject.getOrDefault("password", null);
+        boolean backward = Boolean.valueOf((boolean) jsonObject.getOrDefault("backward", false));
 
         return sendGet(
                 creator,
@@ -230,7 +233,7 @@ public class RSendResource {
                 assetKey, amount,
                 title, message,
                 encoding, encrypt,
-                password
+                password, backward
         );
 
     }

@@ -35,6 +35,7 @@ import org.erachain.core.item.unions.UnionCls;
 import org.erachain.core.payment.Payment;
 import org.erachain.core.telegram.TelegramStore;
 import org.erachain.core.transaction.RSend;
+import org.erachain.core.transaction.TransactionAmount;
 import org.erachain.core.transaction.Transaction;
 import org.erachain.core.transaction.TransactionFactory;
 import org.erachain.core.voting.PollOption;
@@ -3695,6 +3696,17 @@ public class Controller extends Observable {
     public Pair<Integer, Transaction> make_R_Send(String creatorStr, Account creator, ExLink linkTo, DAPP dApp, String recipientStr,
                                                   int feePow, long assetKey, boolean checkAsset, BigDecimal amount, boolean needAmount,
                                                   String title, String message, int messagecode, boolean encrypt, long timestamp) {
+        return make_R_Send(creatorStr, creator, linkTo, dApp, recipientStr, feePow, assetKey, checkAsset, amount, needAmount,
+                title, message, messagecode, encrypt, timestamp, false);
+    }
+
+    /**
+     * @param backward обратное действие: для долга (assetKey &lt; 0) — взыскание долга кредитором
+     */
+    public Pair<Integer, Transaction> make_R_Send(String creatorStr, Account creator, ExLink linkTo, DAPP dApp, String recipientStr,
+                                                  int feePow, long assetKey, boolean checkAsset, BigDecimal amount, boolean needAmount,
+                                                  String title, String message, int messagecode, boolean encrypt, long timestamp,
+                                                  boolean backward) {
 
         Controller cnt = Controller.getInstance();
 
@@ -3807,6 +3819,11 @@ public class Controller extends Observable {
         }
 
         // CREATE RSend
+        if (backward) {
+            return new Pair<Integer, Transaction>(Transaction.VALIDATE_OK, this.r_Send(RSend.CURRENT_VERS, TransactionAmount.BACKWARD_MASK,
+                    (byte) 0, privateKeyAccount, linkTo, dApp, feePow, recipient, assetKey, amount, 0, null,
+                    title, messageBytes, isTextByte, encrypted));
+        }
         return new Pair<Integer, Transaction>(Transaction.VALIDATE_OK, this.r_Send(privateKeyAccount, linkTo, dApp, feePow, recipient,
                 assetKey, amount, title, messageBytes, isTextByte, encrypted, timestamp));
 

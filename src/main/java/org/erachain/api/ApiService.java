@@ -32,6 +32,7 @@ public class ApiService extends Observable {
         s.add(WalletResource.class);
         s.add(RSendResource.class);
         s.add(RSignNoteResource.class);
+        s.add(RVouchResource.class);
         s.add(RecPaymentResource.class);
         s.add(FPoolResource.class);
         s.add(ArbitraryTransactionsResource.class);
