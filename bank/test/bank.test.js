@@ -1186,3 +1186,96 @@ test('счета: клиент банка и кошелёк на устройс�
     assert.strictEqual(r.status, 200, JSON.stringify(r.data));
     assert.strictEqual(r.data.amount, 15);
 });
+
+test('магазины: счёт продавца, заказ → оплата → выдача актива в две фазы без двойной выдачи; адрес вручную; COMPU', async (t) => {
+    const { DEMO_STAFF, DEMO_SEED } = require('../server');
+    const { mulDecimal } = require('../lib/merchants');
+    assert.strictEqual(mulDecimal('0.1', 3), '0.3');
+    assert.strictEqual(mulDecimal('2', 5), '10');
+    const backend = new DemoBackend({ seed: DEMO_SEED });
+    const store = new JsonStore(null, {
+        settings: demoGatewaySettings(backend), sbpSettings: { payoutAccount: backend.mainAccount },
+        invoiceSettings: { channel: backend.invoiceChannel, trustedBanks: [] },
+    });
+    const server = createServer(backend, { store, demoStaff: DEMO_STAFF, networkPort: 9066, jobsIntervalMs: 0 });
+    const base = await listen(server);
+    t.after(() => server.close());
+    const api = async (method, path, body, token) => {
+        const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+        return { status: res.status, data: await res.json() };
+    };
+    const keys = require('../lib/erakeys').deriveAccounts(DEMO_SEED);
+    const owner = (await api('POST', '/api/login', { seed: DEMO_SEED })).data.token;
+    const kassir = (await api('POST', '/api/login', { login: 'kassir', password: 'kassir123' })).data.token;
+    // демо: новый блок перед каждой проверкой — у оплаты появляется подтверждение
+    const deliver = async () => { backend.height += 1; return api('POST', '/api/merchants/deliver', {}, kassir); };
+    const era = async (address) => Number(((await backend.balances(address)).find((b) => b.asset === 1) || { amount: 0 }).amount);
+
+    // счёт магазина — следующий свободный счёт сид-фразы (№1 — основной, №3 — шлюз: служебные)
+    assert.strictEqual((await api('POST', '/api/merchants', { name: 'Касса' }, kassir)).status, 403);
+    let r = await api('POST', '/api/merchants', { name: 'Цифровые товары' }, owner);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    const m = r.data;
+    assert.deepStrictEqual([m.n, m.address], [2, keys[1].address]);
+    assert.strictEqual((await api('POST', '/api/merchants', { name: 'X', address: keys[2].address }, owner)).status, 400, 'служебный счёт шлюза');
+    assert.strictEqual((await api('POST', '/api/merchants', { name: 'Y' }, owner)).data.n, 4);
+    r = await api('POST', `/api/merchants/${m.id}/products`, { title: 'Пакет ERA', asset: 1, amount: '2', price: '5', curr: 1 }, owner);
+    const product = r.data.products[0];
+    assert.strictEqual((await api('POST', `/api/merchants/${m.id}/order`, { productId: product.id, qty: 1000, user: '+79001112233' }, owner)).status, 400, 'товара не хватает');
+
+    // заказ 3 шт.: счёт на 15 ERA, к выдаче 6 ERA; покупатель платит со счёта №1
+    r = await api('POST', `/api/merchants/${m.id}/order`, { productId: product.id, qty: 3, user: '+7 900 111-22-33' }, kassir);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    const order = r.data;
+    assert.deepStrictEqual([order.sum, order.deliver.amount, order.deliver.state, order.acceptAny], [15, '6', 'waiting_payment', true]);
+    r = await api('POST', '/api/invoices/pay', { signature: order.signature, user: '79001112233', from: keys[0].address }, owner);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+
+    // у магазина «ушёл» товар — перевод подписан, но ждёт пополнения (код 11), подпись та же
+    const stock = await era(m.address);
+    await backend.transfer({ from: m.address, to: keys[4].address, asset: 1, amount: String(stock - 1) }, DEMO_STAFF.walletPassword);
+    r = await deliver();
+    let o = r.data.orders.find((x) => x.signature === order.signature);
+    assert.strictEqual(o.deliver.state, 'made', JSON.stringify(o.deliver));
+    assert.match(o.deliver.message, /Не хватает товара/);
+    assert.strictEqual(o.deliver.to, keys[0].address, 'выдача тому, кто оплатил');
+    const txId = o.deliver.txId;
+    await backend.transfer({ from: keys[0].address, to: m.address, asset: 1, amount: '50' }, DEMO_STAFF.walletPassword);
+    const before = await era(keys[0].address);
+    for (let i = 0; i < 3; i++) await deliver();
+    o = (await api('GET', '/api/merchants/orders', null, kassir)).data.find((x) => x.signature === order.signature);
+    assert.deepStrictEqual([o.deliver.state, o.deliver.txId, o.deliver.raw], ['delivered', txId, undefined]);
+    assert.strictEqual(await era(keys[0].address), before + 6, 'выдано ровно один раз');
+
+    // оплата через доверенный банк: адрес покупателя неизвестен — указывается вручную
+    await api('PUT', '/api/invoices/settings', { trustedBanks: [keys[0].address] }, owner);
+    const order2 = (await api('POST', `/api/merchants/${m.id}/order`, { productId: product.id, qty: 1, user: 'buyer@example.com' }, owner)).data;
+    await api('POST', '/api/invoices/pay', { signature: order2.signature, user: 'buyer@example.com', from: keys[0].address }, owner);
+    r = await deliver();
+    o = r.data.orders.find((x) => x.signature === order2.signature);
+    assert.strictEqual(o.deliver.state, 'awaiting_address');
+    assert.strictEqual((await api('POST', `/api/merchants/orders/${order2.signature}/address`, { address: 'плохой' }, kassir)).status, 400);
+    assert.strictEqual((await api('POST', `/api/merchants/orders/${order2.signature}/address`, { address: keys[6].address }, kassir)).status, 200);
+    await deliver();
+    await deliver();
+    assert.strictEqual(await era(keys[6].address), 2);
+
+    // заказ с адресом получателя: выдача сразу на него
+    const order3 = (await api('POST', `/api/merchants/${m.id}/order`, { productId: product.id, deliverTo: keys[7].address }, owner)).data;
+    assert.strictEqual(order3.user, keys[7].address);
+    await api('POST', '/api/invoices/pay', { signature: order3.signature, user: keys[7].address, from: keys[0].address }, owner);
+    await deliver();
+    await deliver();
+    assert.strictEqual(await era(keys[7].address), 2);
+
+    // обзор: остаток товара, статистика; контроль COMPU у магазинов и служебных счетов
+    r = await api('GET', '/api/merchants', null, kassir);
+    const ov = r.data.find((x) => x.id === m.id);
+    assert.deepStrictEqual([ov.stats.orders, ov.stats.delivered, ov.lowCompu], [3, 3, false]);
+    assert.strictEqual(Number(ov.products[0].stock), await era(m.address));
+    await api('PATCH', `/api/merchants/${m.id}`, { minCompu: '1000' }, owner);
+    r = await api('GET', '/api/merchants/alerts', null, kassir);
+    assert.ok(r.data.some((a) => a.address === m.address && a.min === 1000), JSON.stringify(r.data));
+    assert.ok(r.data.some((a) => a.label === 'Счёт выплат СБП') === false, 'у основного счёта COMPU хватает');
+    assert.ok(!r.data.some((a) => a.label === 'Канал счетов на оплату'), 'канал только принимает — комиссия ему не нужна');
+});

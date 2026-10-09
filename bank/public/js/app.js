@@ -25,10 +25,11 @@ import sbp from './views/sbp.js';
 import invoices from './views/invoices.js';
 import loans from './views/loans.js';
 import keys from './views/keys.js';
+import shops from './views/shops.js';
 
-const views = { keys, home, transfer, history, assets, polls, exchange, swap, staff: staffView, sbp, invoices, loans, messages, documents, persons, catalog, bank, network, more, settings };
+const views = { keys, home, transfer, history, assets, polls, exchange, swap, staff: staffView, sbp, invoices, shops, loans, messages, documents, persons, catalog, bank, network, more, settings };
 // разделы, доступные из «Сервисов», подсвечивают эту вкладку
-const navOf = { keys: 'more', history: 'home', sbp: 'bank', invoices: 'bank', loans: 'bank', swap: 'more', staff: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
+const navOf = { keys: 'more', history: 'home', sbp: 'bank', invoices: 'bank', shops: 'bank', loans: 'bank', swap: 'more', staff: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
 
 let renderId = 0;
 

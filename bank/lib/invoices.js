@@ -185,7 +185,7 @@ class Invoices {
 
     // ---------- магазин: выставить счёт ----------
 
-    async issue(body, password) {
+    async issue(body, password, extra = null) {
         const from = text(body.from, 40);
         const channel = text(body.channel, 40) || this.store.data.invoiceSettings.channel;
         if (!isAddress(from)) throw new BankError('Выберите счёт магазина');
@@ -213,7 +213,7 @@ class Invoices {
             ...(callback ? { callback } : {}),
         };
         const res = await this.backend.sendMessage({ from, to: channel, title: user, message: JSON.stringify(msg), encrypt: false }, password);
-        const inv = { signature: res.signature, shop: from, channel, ...msg, sum, status: 'issued', paidSum: 0, notices: [], createdAt: Date.now() };
+        const inv = { signature: res.signature, shop: from, channel, ...msg, sum, status: 'issued', paidSum: 0, notices: [], createdAt: Date.now(), ...(extra || {}) };
         this.store.data.invoicesIssued.unshift(inv);
         this.store.save();
         return inv;
@@ -277,7 +277,9 @@ class Invoices {
     }
 
     recompute(inv, minConf) {
-        const valid = inv.notices.filter((x) => x.trusted && x.assetOk !== false && !x.late);
+        // счёт магазина нашего банка (acceptAny): засчитывается любой фактический перевод нужного актива —
+        // сумма берётся из самого перевода, так что доверие к банку-отправителю не требуется
+        const valid = inv.notices.filter((x) => (x.trusted || inv.acceptAny) && x.assetOk !== false && !x.late);
         const confirmed = valid.filter((x) => (x.confirmations ?? 1) >= minConf);
         inv.paidSum = Number(confirmed.reduce((s, x) => s + (x.amount ?? x.sum ?? 0), 0).toFixed(8));
         inv.pendingSum = Number(valid.filter((x) => !confirmed.includes(x)).reduce((s, x) => s + (x.amount || 0), 0).toFixed(8));

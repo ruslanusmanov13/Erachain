@@ -262,7 +262,9 @@ export default {
             el('b', {}, 'Счета на оплату →'), el('span', { class: 'muted' }, 'Безопасный платёж: найти и оплатить счета магазинов по телефону клиента, выставить свои'));
         const loanLink = el('a', { class: 'menu-tile sbp-link', href: '#/loans' },
             el('b', {}, 'Кредиты →'), el('span', { class: 'muted' }, 'Договоры с графиком, выдача в долг в блокчейне, погашение и взыскание'));
-        return el('div', { class: 'stack' }, el('div', { class: 'grid-2' }, sbpLink, invLink, loanLink),
+        const shopLink = el('a', { class: 'menu-tile sbp-link', href: '#/shops' },
+            el('b', {}, 'Магазины →'), el('span', { class: 'muted' }, 'Счета продавцов, товары-активы, выдача покупателю после оплаты, контроль COMPU'));
+        return el('div', { class: 'stack' }, el('div', { class: 'grid-2' }, sbpLink, invLink, shopLink, loanLink),
             el('div', {}, tabs([['statements', 'Выписки'], ['deposits', 'Поступления'], ['withdrawals', 'Вывод'], ['settings', 'Шлюз']], mode, show), body));
     },
 };

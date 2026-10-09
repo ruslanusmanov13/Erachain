@@ -14,6 +14,7 @@ const { Staff, ROLES } = require('./lib/staff');
 const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
 const { Invoices } = require('./lib/invoices');
 const { Loans } = require('./lib/loans');
+const { Merchants } = require('./lib/merchants');
 const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Decode, base58Encode } = require('./lib/seed');
 const { deriveAccounts } = require('./lib/erakeys');
 const { Clients } = require('./lib/clients');
@@ -51,6 +52,18 @@ function createApp(backend, options = {}) {
     const loans = new Loans(backend, store);
     const ownerKey = new OwnerKey(store);
     const clients = new Clients(store);
+    // служебные счета банка: основной, шлюз, выплаты СБП, канал счетов — магазинам их не выдаём, COMPU на них контролируем
+    const serviceAccounts = () => [
+        { address: ownerKey.addresses()[0], label: 'Основной счёт банка' },
+        { address: (store.data.settings || {}).gatewayAccount, label: 'Счёт шлюза' },
+        { address: (store.data.sbpSettings || {}).payoutAccount, label: 'Счёт выплат СБП' },
+        { address: (store.data.invoiceSettings || {}).channel, label: 'Канал счетов на оплату', noFee: true }, // только принимает телеграммы
+    ].filter((a) => a.address);
+    const merchants = new Merchants(backend, store, {
+        invoices,
+        ownAccounts: () => ((ownerKey.identity() || {}).accounts || []).map((a) => ({ n: a.n, address: a.address })),
+        reserved: () => serviceAccounts().map((a) => a.address),
+    });
     // порт сети для подписи транзакций на устройстве: 9046 — основная, 9066 — тестовая (RPC-порт ноды − 2)
     const networkPort = options.networkPort || backend.networkPort || 9046;
     const walletNonces = new Map(); // одноразовые коды входа кошелька на устройстве
@@ -88,6 +101,10 @@ function createApp(backend, options = {}) {
                 await invoices.tick();
                 if (staff.shift && store.data.invoicesIssued.some((i) => !['paid'].includes(i.status))) {
                     await invoices.checkIssued(staff.walletPassword({ password: null }));
+                }
+                // магазины: выдача товара по оплаченным заказам
+                if (staff.shift && store.data.invoicesIssued.some((i) => i.deliver && !['delivered', 'expired', 'cancelled', 'error'].includes(i.deliver.state))) {
+                    await merchants.deliveries(staff.walletPassword({ password: null }));
                 }
             } catch (e) {
                 if (e.status !== 502) console.error('invoices:', e.message);
@@ -175,6 +192,12 @@ function createApp(backend, options = {}) {
             if (method === 'GET' || ['/api/invoices/find', '/api/invoices/check', '/api/invoices/prepare', '/api/invoices/paid-signed'].includes(pathname)) return ['read'];
             if (pathname === '/api/invoices/cleanup') return ['settings'];
             return pathname === '/api/invoices/settings' ? ['settings'] : ['sign'];
+        }
+        if (pathname.startsWith('/api/merchants')) {
+            if (method === 'GET') return ['read'];
+            if (/\/order$/.test(pathname)) return ['sign'];
+            if (/\/orders\/[^/]+\/(address|retry)$/.test(pathname) || pathname === '/api/merchants/deliver') return ['gateway'];
+            return ['settings'];
         }
         if (pathname.startsWith('/api/sbp/')) {
             if (method === 'GET') return ['read'];
@@ -781,6 +804,22 @@ function createApp(backend, options = {}) {
         ['POST', /^\/api\/invoices\/([1-9A-HJ-NP-Za-km-z]{60,100})\/cancel$/, ({ m, session }) => invoices.cancel(m[1], session.password)],
         ['POST', '/api/invoices/cleanup', async ({ req, session }) => invoices.cleanup(session.password, await readJson(req))],
         ['GET', '/api/invoices/paid', () => invoices.paidList()],
+
+        // магазины: счета продавцов, товары, заказы с выдачей актива после оплаты, контроль COMPU
+        ['GET', '/api/merchants', () => merchants.overview()],
+        ['POST', '/api/merchants', async ({ req, session }) => merchants.create(await readJson(req), session.password)],
+        ['GET', '/api/merchants/alerts', () => merchants.compuAlerts(serviceAccounts().filter((a) => !a.noFee))],
+        ['GET', '/api/merchants/orders', ({ url }) => merchants.orders(url.searchParams.get('merchant'))],
+        ['POST', '/api/merchants/deliver', async ({ session }) => {
+            await invoices.checkIssued(session.password);
+            return { delivered: await merchants.deliveries(session.password), orders: merchants.orders() };
+        }],
+        ['POST', /^\/api\/merchants\/orders\/([1-9A-HJ-NP-Za-km-z]+)\/address$/, async ({ req, m }) => merchants.setAddress(m[1], (await readJson(req)).address)],
+        ['POST', /^\/api\/merchants\/orders\/([1-9A-HJ-NP-Za-km-z]+)\/retry$/, ({ m }) => merchants.retry(m[1])],
+        ['PATCH', /^\/api\/merchants\/([0-9a-f]+)$/, async ({ req, m }) => merchants.update(m[1], await readJson(req))],
+        ['POST', /^\/api\/merchants\/([0-9a-f]+)\/products$/, async ({ req, m }) => merchants.saveProduct(m[1], await readJson(req))],
+        ['DELETE', /^\/api\/merchants\/([0-9a-f]+)\/products\/([0-9a-f]+)$/, ({ m }) => merchants.removeProduct(m[1], m[2])],
+        ['POST', /^\/api\/merchants\/([0-9a-f]+)\/order$/, async ({ req, m, session }) => merchants.order(m[1], await readJson(req), session.password)],
 
         // СБП: публичная страница оплаты (без входа)
         ['GET', '/api/public/sbp/config', () => requireSbp().publicConfig(), { public: true }],
