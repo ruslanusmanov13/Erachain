@@ -416,7 +416,15 @@ HMAC-SHA256 поток + HMAC-тег). Приватные ключи после 
 
 **Готовый APK** собирает GitHub Actions (`.github/workflows/bank-android.yml`) при каждом изменении
 `bank/`: вкладка **Actions → «Банк Erachain — Android APK» → артефакт `erachain-bank-apk`**.
-Для тега `bank-v1.0.0` APK публикуется в Releases.
+Для тега `bank-v1.1` APK публикуется в Releases.
+
+В форке Actions по умолчанию выключены. Их нужно включить:
+1. **Settings → Actions → General → «Allow all actions and reusable workflows» → Save**.
+   Галку «Require actions to be pinned to a full-length commit SHA» не ставить: сборка использует действия по версии (`@v4`).
+2. **Workflow permissions → «Read and write permissions» → Save**. Это нужно для публикации релизов.
+3. На вкладке **Actions** нажать «I understand my workflows, go ahead and enable them», если такая кнопка есть.
+
+После этого сборка запускается при следующем изменении в `bank/`.
 
 **Сборка вручную** (нужны Android Studio / Android SDK и JDK 21):
 
