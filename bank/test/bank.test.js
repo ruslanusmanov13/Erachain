@@ -1329,3 +1329,61 @@ test('1С: остатки на начало и конец, КПП, справо�
     assert.match(r, /НачальныйОстаток=0\.00[\s\S]*ВсегоПоступило=1250\.50[\s\S]*ВсегоСписано=0\.50[\s\S]*КонечныйОстаток=1250\.00/);
     assert.match(r, /Получатель=ИП Петров/);
 });
+
+test('курсы и маркет-мейкер: медиана источников, post-only без самосделок, лимиты, стоп-кран, исполнение', async (t) => {
+    const { api, call, accounts, backend } = await startDemo(t);
+    const main = accounts[0].address;
+    const other = accounts[1].address;
+    // курс ERA/COMPU: стакан (без ордеров банка) и 7Pay расходятся — курса нет; по одному стакану — середина
+    let r = await call('GET', '/api/rates?have=1&want=2');
+    assert.strictEqual(r.data.price, null);
+    assert.match(r.data.reason, /расходятся/);
+    r = await call('GET', '/api/rates?have=1&want=2&sources=dex');
+    const mid = (0.05 + 3 / 62) / 2;
+    assert.ok(Math.abs(r.data.price - mid) < 1e-7, JSON.stringify(r.data));
+
+    // другой счёт банка уже стоит в стакане на покупку по 0,0498 — продажа ниже этой цены была бы самосделкой
+    await call('POST', '/api/exchange/orders', { creator: other, have: 2, want: 1, haveAmount: '0.498', wantAmount: '10' });
+    const tradesBefore = backend.tradesList.length;
+    r = await call('POST', '/api/mm/pairs', { have: 1, want: 2, account: main, sources: ['dex'], spreadPct: 2, levels: 2, stepPct: 1, levelSize: '10', dailySellLimit: '15', enabled: true });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    const pair = r.data;
+    r = await call('POST', '/api/mm/tick');
+    const res = r.data[0];
+    assert.strictEqual(res.placed, 3, JSON.stringify(res));
+    assert.ok(res.skipped.some((x) => /исполнилась бы сразу/.test(x)), 'продажа по 0,0497 скрестилась бы с ордером банка');
+    assert.strictEqual(backend.tradesList.length, tradesBefore, 'ни одной сделки');
+    let view = (await call('GET', '/api/mm')).data.pairs[0];
+    assert.deepStrictEqual(view.orders.map((o) => `${o.side}${o.level}`).sort(), ['ask1', 'bid0', 'bid1']);
+    // повторный проход ничего не добавляет: лимит продаж за сутки (10 из 15) и уровни на месте
+    r = await call('POST', '/api/mm/tick');
+    assert.strictEqual(r.data[0].placed, 0);
+    assert.ok(r.data[0].skipped.includes('лимит продаж за сутки') || r.data[0].skipped.some((x) => /сразу/.test(x)));
+
+    // исполнение: часть ордера на покупку забрали — учитывается в суточном обороте
+    const bid = view.orders.find((o) => o.side === 'bid' && o.level === 0);
+    const book = backend.orders.find((o) => o.seqNo === bid.seqNo);
+    book.left = book.left / 2n;
+    await call('POST', '/api/mm/tick');
+    view = (await call('GET', '/api/mm')).data.pairs[0];
+    assert.ok(Math.abs(view.boughtToday - 5) < 1e-6, String(view.boughtToday));
+
+    // стоп-кран: скачок курса больше 10 % — пара остановлена, все её ордера сняты
+    const s = await call('GET', '/api/mm');
+    assert.ok(s.data.pairs[0].orders.length > 0);
+    backend.orders.filter((o) => o.creator !== main && o.creator !== other && o.active).forEach((o) => { o.wantAmount = o.wantAmount * 2n; });
+    r = await call('POST', '/api/mm/tick');
+    assert.strictEqual(r.data[0].skipped, 'jump', JSON.stringify(r.data));
+    view = (await call('GET', '/api/mm')).data.pairs[0];
+    assert.deepStrictEqual([view.paused, view.orders.length], [true, 0]);
+    assert.ok(backend.orders.filter((o) => o.creator === main && o.active).length === 0, 'ордера банка сняты с биржи');
+    // возобновление — с новым курсом
+    await call('POST', `/api/mm/${pair.id}/resume`);
+    r = await call('POST', '/api/mm/tick');
+    assert.ok(r.data[0].placed > 0, JSON.stringify(r.data));
+    // права: наблюдатель видит курсы, но не торгует и не меняет настройки
+    await call('POST', '/api/staff', { login: 'viewer1', role: 'viewer', password: 'viewer123' });
+    const vt = (await api('POST', '/api/login', { login: 'viewer1', password: 'viewer123' })).data.token;
+    assert.strictEqual((await api('POST', '/api/mm/tick', {}, vt)).status, 403);
+    assert.strictEqual((await api('PUT', '/api/mm/settings', { maxSourceDeviationPct: 50 }, vt)).status, 403);
+});

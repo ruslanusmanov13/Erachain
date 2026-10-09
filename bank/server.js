@@ -15,6 +15,7 @@ const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
 const { Invoices } = require('./lib/invoices');
 const { Loans } = require('./lib/loans');
 const { Merchants } = require('./lib/merchants');
+const { MarketMaker } = require('./lib/marketmaker');
 const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Decode, base58Encode } = require('./lib/seed');
 const { deriveAccounts } = require('./lib/erakeys');
 const { Clients } = require('./lib/clients');
@@ -78,6 +79,8 @@ function createApp(backend, options = {}) {
             if (backend.seed && !ownerKey.bound()) ownerKey.bind(backend.seed, options.demoStaff.walletPassword);
         }
     }
+    // курсы (7Pay, стакан биржи, ручной) и маркет-мейкер на бирже Erachain
+    const mm = new MarketMaker(backend, store, { sevenpay: options.sevenpay || null });
     // обменник 7Pay: options.sevenpay — клиент API (SevenPayClient или SevenPayDemo); без него раздел выключен
     const swap = options.sevenpay ? new SwapService(options.sevenpay, backend, store) : null;
     const requireSwap = () => {
@@ -102,6 +105,12 @@ function createApp(backend, options = {}) {
                 await invoices.tick();
                 if (staff.shift && store.data.invoicesIssued.some((i) => !['paid'].includes(i.status))) {
                     await invoices.checkIssued(staff.walletPassword({ password: null }));
+                }
+                // маркет-мейкер: ордера вокруг курса (только при открытой смене — подпись паролем смены)
+                if (staff.shift && store.data.mmSettings.pairs.some((p) => p.enabled || mm.pairOrders(p).length)
+                    && Date.now() - (mm.lastTick || 0) >= (options.mmIntervalMs || 60000)) {
+                    mm.lastTick = Date.now();
+                    await mm.tick(staff.walletPassword({ password: null }));
                 }
                 // магазины: выдача товара по оплаченным заказам
                 if (staff.shift && store.data.invoicesIssued.some((i) => i.deliver && !['delivered', 'expired', 'cancelled', 'error'].includes(i.deliver.state))) {
@@ -193,6 +202,11 @@ function createApp(backend, options = {}) {
             if (method === 'GET' || ['/api/invoices/find', '/api/invoices/check', '/api/invoices/prepare', '/api/invoices/paid-signed'].includes(pathname)) return ['read'];
             if (pathname === '/api/invoices/cleanup') return ['settings'];
             return pathname === '/api/invoices/settings' ? ['settings'] : ['sign'];
+        }
+        if (pathname.startsWith('/api/mm') || pathname === '/api/rates') {
+            if (method === 'GET') return ['read'];
+            if (pathname === '/api/mm/settings' || pathname === '/api/mm/pairs' || /\/remove$/.test(pathname)) return ['settings'];
+            return ['sign']; // проход, остановка и возобновление — торговые действия
         }
         if (pathname.startsWith('/api/merchants')) {
             if (method === 'GET') return ['read'];
@@ -815,6 +829,23 @@ function createApp(backend, options = {}) {
         ['POST', /^\/api\/invoices\/([1-9A-HJ-NP-Za-km-z]{60,100})\/cancel$/, ({ m, session }) => invoices.cancel(m[1], session.password)],
         ['POST', '/api/invoices/cleanup', async ({ req, session }) => invoices.cleanup(session.password, await readJson(req))],
         ['GET', '/api/invoices/paid', () => invoices.paidList()],
+
+        // курсы и маркет-мейкер
+        ['GET', '/api/rates', async ({ url, session }) => {
+            const have = Number(url.searchParams.get('have'));
+            const want = Number(url.searchParams.get('want'));
+            if (!Number.isSafeInteger(have) || !Number.isSafeInteger(want) || have <= 0 || want <= 0 || have === want) throw new BankError('Пара: have и want — номера активов');
+            if (session.password) await mm.ownSet(session.password).catch(() => null);
+            const sources = (url.searchParams.get('sources') || 'dex,sevenpay,manual').split(',');
+            return { have, want, ...(await mm.rate({ have, want, sources })) };
+        }],
+        ['GET', '/api/mm', () => mm.view()],
+        ['PUT', '/api/mm/settings', async ({ req }) => mm.updateSettings(await readJson(req))],
+        ['POST', '/api/mm/pairs', async ({ req }) => mm.savePair(await readJson(req))],
+        ['POST', '/api/mm/tick', ({ session }) => mm.tick(session.password)],
+        ['POST', /^\/api\/mm\/([0-9a-f]+)\/pause$/, ({ m, session }) => mm.pause(m[1], session.password)],
+        ['POST', /^\/api\/mm\/([0-9a-f]+)\/resume$/, ({ m }) => mm.resume(m[1])],
+        ['POST', /^\/api\/mm\/([0-9a-f]+)\/remove$/, ({ m, session }) => mm.removePair(m[1], session.password)],
 
         // магазины: счета продавцов, товары, заказы с выдачей актива после оплаты, контроль COMPU
         ['GET', '/api/merchants', () => merchants.overview()],
