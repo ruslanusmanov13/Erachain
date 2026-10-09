@@ -18,7 +18,7 @@ ErachainBP is a Java application and supported by all operation systems.
 - RPC - http://datachains.world/static/RPC.html
 - JS SDK - https://github.com/erachain/sdk-js
 - PHP SDK - https://github.com/erachain/sdk-php
-- Банк Erachain (веб-приложение для счетов и переводов) - [bank/](bank/README.md)
+- Банк Erachain (Android-приложение и веб-кабинет: счета, активы, голосования, биржа, документы, интеграция с банками) - [bank/](bank/README.md)
 
 ## Documentation
 
