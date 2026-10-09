@@ -2,6 +2,8 @@
 import { get, post, session, setUnauthorizedHandler, needsServer, isNative, serverUrl, setServerUrl } from './api.js';
 import { $, el, card, field, input, form, toast, spinner, confirm, tabs } from './ui.js';
 import { setupWizard, seedInput, registerView } from './seed.js';
+import { walletLogin, vaultInfo, openVault, saveVault, clearVault, lockKeys } from './wallet/session.js';
+import { deriveAccounts } from './wallet/keys.js';
 import { state, loadAccounts, loadMe } from './state.js';
 import home from './views/home.js';
 import transfer from './views/transfer.js';
@@ -111,11 +113,27 @@ function showLogin(setup) {
     const body = el('div', {});
     const methodBody = el('div', {});
     const seedForm = (byPassword) => {
+        // кошелёк на устройстве: фраза не уходит в банк — ключи считаются и подписывают здесь
+        const device = el('input', { type: 'checkbox', name: 'device', value: '1' });
+        const pinBox = el('div', { class: 'stack hidden' },
+            field('PIN для быстрого входа (необязательно)', input('pin', { type: 'password', inputmode: 'numeric', autocomplete: 'off', placeholder: '4–12 цифр' }),
+                'Фраза сохранится на этом устройстве в зашифрованном виде; войти можно будет по PIN'));
+        device.addEventListener('change', () => pinBox.classList.toggle('hidden', !device.checked));
         const f = form([
             byPassword
                 ? field('Пароль кошелька ноды', input('password', { type: 'password', autocomplete: 'current-password', required: true }))
                 : field('Сид-фраза', seedInput('seed', { autofocus: true }), 'Откроются 21 счёт с приватными ключами — выберите любой для входа в кабинет'),
+            byPassword ? null : el('label', { class: 'check-row' }, device, el('span', {}, 'Ключи только на этом устройстве — фраза не отправляется в банк, операции подписываются на телефоне')),
+            byPassword ? null : pinBox,
         ], 'Войти', async (data, formEl) => {
+            if (data.device) {
+                const accounts = deriveAccounts(data.seed);
+                const r = await walletLogin(accounts);
+                if (data.pin) await saveVault(data.seed.replace(/\s+/g, ''), data.pin);
+                formEl.reset();
+                loggedIn(r.token, '#/keys');
+                return;
+            }
             const r = await post('login', byPassword ? { password: data.password } : { seed: data.seed });
             formEl.reset();
             loggedIn(r.token, r.keys ? '#/keys' : '#/home');
@@ -125,10 +143,26 @@ function showLogin(setup) {
             e.preventDefault();
             methodBody.replaceChildren(...seedForm(!byPassword));
         });
+        // кошелёк сохранён на устройстве под PIN — быстрый вход
+        const vault = !byPassword && vaultInfo();
+        const quick = vault ? card(
+            el('div', { class: 'small' }, 'Кошелёк на этом устройстве: ', el('span', { class: 'mono' }, vault.address.slice(0, 8) + '…')),
+            form([field('PIN', input('pin', { type: 'password', inputmode: 'numeric', autocomplete: 'off', required: true }))], 'Войти по PIN', async (d) => {
+                const seed = await openVault(d.pin);
+                const r = await walletLogin(deriveAccounts(seed));
+                loggedIn(r.token, '#/keys');
+            }),
+            el('button', { class: 'btn small', type: 'button', onclick: async () => {
+                if (await confirm('Удалить кошелёк с этого устройства? Войти можно будет только сид-фразой.')) {
+                    clearVault();
+                    methodBody.replaceChildren(...seedForm(false));
+                }
+            } }, 'Удалить с устройства')) : null;
         return [
+            quick,
             el('p', { class: 'muted small' }, byPassword
                 ? 'Запасной вход владельца банка. Пароль передаётся только серверу банка и не сохраняется на устройстве.'
-                : 'Владелец банка и клиенты входят своей сид-фразой — 44 символа Base58. Фраза нигде не сохраняется.'),
+                : 'Владелец банка и клиенты входят своей сид-фразой — 44 символа Base58.'),
             f,
             el('p', { class: 'center' }, toggle),
         ];
@@ -202,7 +236,7 @@ function showServerSetup() {
 function showUser() {
     const me = state.me;
     if (!me) return;
-    const shift = ['owner', 'account', 'client'].includes(me.user.role) ? '' : me.shift.open ? ' · смена открыта' : ' · смена закрыта';
+    const shift = ['owner', 'account', 'client', 'wallet'].includes(me.user.role) ? '' : me.shift.open ? ' · смена открыта' : ' · смена закрыта';
     $('status').dataset.user = `${me.user.name} (${me.role.toLowerCase()})${shift}`;
     $('status').title = $('status').dataset.user;
 }
@@ -220,6 +254,7 @@ async function refreshStatus() {
 }
 
 setUnauthorizedHandler(() => {
+    lockKeys();
     state.accounts = [];
     state.me = null;
     showEntry();
@@ -228,6 +263,7 @@ setUnauthorizedHandler(() => {
 window.addEventListener('hashchange', render);
 window.addEventListener('bank:user', () => { showUser(); refreshStatus(); });
 window.addEventListener('bank:logout', async () => {
+    lockKeys(); // ключи кошелька на устройстве — из памяти
     try { await post('logout'); } catch (e) { /* ignore */ }
     session.setToken(null);
     state.accounts = [];

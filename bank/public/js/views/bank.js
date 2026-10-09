@@ -242,7 +242,7 @@ export default {
     title: 'Банк',
     async render(params) {
         // кабинет по ключу счёта: только выписки своего счёта
-        if (state.me && ['account', 'client'].includes(state.me.user.role)) return statements();
+        if (state.me && ['account', 'client', 'wallet'].includes(state.me.user.role)) return statements();
         const views = { statements, deposits, withdrawals, settings: gatewaySettings };
         let mode = params[0] === 'gateway' ? 'deposits' : params[0];
         if (!views[mode]) mode = 'statements';

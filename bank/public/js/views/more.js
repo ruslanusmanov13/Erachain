@@ -22,6 +22,8 @@ const ITEMS = [
     ['#/settings', 'Настройки', 'Сид-фраза, сервер, выход', 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19 12l2-1-2-4-2 1-2-2V4h-4v2L9 7 7 6 5 10l2 1v2l-2 1 2 4 2-1 2 2v2h4v-2l2-2 2 1 2-4-2-1z'],
 ];
 
+// кошелёк на устройстве: подписываются на телефоне переводы и письма; остальное — просмотр
+const WALLET = new Set(['#/keys', '#/history', '#/transfer/batch', '#/messages', '#/catalog', '#/network', '#/settings']);
 const CABINET = new Set(['#/history', '#/transfer/batch', '#/polls', '#/exchange/1/2', '#/documents', '#/messages', '#/persons', '#/assets/issue', '#/catalog', '#/network', '#/settings']);
 
 function icon(d) {
@@ -44,9 +46,10 @@ export default {
         // кабинет по ключу счёта: только разделы, работающие с одним счётом
         const role = state.me && state.me.user.role;
         const cabinet = role === 'account' || role === 'client';
-        // ключи: у владельца и у клиента, вошедшего фразой
-        const allowed = (i) => (i[4] === 'wallet' ? can('wallet') || (role === 'client' && state.me.keys > 0) : !i[4] || can(i[4]));
-        const items = ITEMS.filter((i) => allowed(i) && (!cabinet || CABINET.has(i[0]) || i[0] === '#/keys'));
+        // ключи: у владельца, у клиента, вошедшего фразой, и у кошелька на устройстве
+        const allowed = (i) => (i[4] === 'wallet' ? can('wallet') || role === 'wallet' || (role === 'client' && state.me.keys > 0) : !i[4] || can(i[4]));
+        const items = ITEMS.filter((i) => allowed(i) && (role === 'wallet' ? WALLET.has(i[0])
+            : !cabinet || CABINET.has(i[0]) || i[0] === '#/keys'));
         return el('div', { class: 'menu-grid' }, items.map(([href, title, sub, d]) => el('a', { class: 'menu-tile', href },
             icon(d), el('b', {}, title), el('span', { class: 'muted' }, sub))));
     },

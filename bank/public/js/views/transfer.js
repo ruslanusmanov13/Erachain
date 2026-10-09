@@ -1,6 +1,15 @@
 import { post } from '../api.js';
 import { el, card, field, input, form, tabs, fmt, short, toast, openDialog, closeDialog, kv } from '../ui.js';
 import { state, loadAccounts, currentAccount, accountSelect, assetSelect, assetName, setCurrent } from '../state.js';
+import { isWalletRole, sendSigned } from '../wallet/session.js';
+import { withDeviceKeys } from '../seed.js';
+
+// кошелёк на устройстве: перевод подписывается на телефоне и только отправляется через банк
+async function transfer(t) {
+    if (!isWalletRole(state.me)) return post('transfer', t);
+    const r = await withDeviceKeys(() => sendSigned(t));
+    return { ...r, to: t.to, amount: t.amount, asset: t.asset };
+}
 
 function singleForm() {
     const acc = currentAccount();
@@ -18,9 +27,11 @@ function singleForm() {
         field('Назначение платежа', input('title', { maxlength: 250, placeholder: 'Например: оплата по счёту №15' })),
         field('Сообщение получателю', el('textarea', { name: 'message', rows: 3, maxlength: 4000 })),
         el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'encrypt', value: '1' }), 'Зашифровать сообщение (прочитает только получатель)'),
-        el('p', { class: 'tiny muted' }, 'Комиссия сети списывается в COMPU с вашего счёта. Перевод в блокчейне необратим.'),
+        el('p', { class: 'tiny muted' }, isWalletRole(state.me)
+            ? 'Перевод подписывается на этом устройстве — ключ никуда не передаётся. Комиссия сети — в COMPU. Перевод необратим.'
+            : 'Комиссия сети списывается в COMPU с вашего счёта. Перевод в блокчейне необратим.'),
     ], 'Перевести', async (d, f) => {
-        const r = await post('transfer', {
+        const r = await transfer({
             from: d.from, to: d.to.trim(), asset: Number(d.asset), amount: d.amount.replace(',', '.'),
             title: d.title, message: d.message, encrypt: d.encrypt === '1',
         });
@@ -64,7 +75,22 @@ function batchForm() {
         fileBtn,
     ], 'Отправить выплаты', async (d) => {
         const payments = parse(d.list);
-        const r = await post('transfer/batch', { from: d.from, asset: Number(d.asset), title: d.title, payments });
+        let r;
+        if (isWalletRole(state.me)) {
+            // каждая выплата подписывается на устройстве отдельной транзакцией
+            const results = [];
+            for (const p of payments) {
+                try {
+                    const x = await withDeviceKeys(() => sendSigned({ from: d.from, to: p.to, asset: Number(d.asset), amount: p.amount, title: p.title || d.title }));
+                    results.push({ ...p, ok: true, signature: x.signature });
+                } catch (e) {
+                    results.push({ ...p, ok: false, error: e.message });
+                }
+            }
+            r = { results, sent: results.filter((x) => x.ok).length, total: results.length };
+        } else {
+            r = await post('transfer/batch', { from: d.from, asset: Number(d.asset), title: d.title, payments });
+        }
         await loadAccounts();
         const table = el('table', { class: 'data' }, el('tr', {}, el('th', {}, 'Получатель'), el('th', { class: 'right' }, 'Сумма'), el('th', {}, 'Результат')));
         for (const x of r.results) {

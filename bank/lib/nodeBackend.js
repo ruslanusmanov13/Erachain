@@ -222,7 +222,14 @@ class NodeBackend {
 
     // данные транзакции для расшифровки на устройстве: зашифрованное сообщение и ключ отправителя
     async txData(signature) {
-        const tx = await this.call('transactions/signature/' + signature);
+        let tx;
+        try {
+            tx = await this.call('transactions/signature/' + signature);
+        } catch (e) {
+            if (e.code !== 24) throw e;
+            tx = await this.call('telegrams/get/' + signature); // телеграмма — не в блокчейне
+            tx = tx.transaction || tx;
+        }
         return {
             signature, from: tx.creator, to: tx.recipient, creatorPublicKey: tx.publickey, encrypted: !!tx.encrypted,
             data: tx.encrypted ? tx.data || null : null, message: tx.encrypted ? null : tx.message ?? null, title: tx.title || '',
@@ -231,7 +238,8 @@ class NodeBackend {
 
     // расшифровка нодой — для счетов в кошельке ноды (банк, клиенты банка)
     async decrypt(signature, password) {
-        const r = await this.call('transactions/datadecrypt/' + signature, { query: { password } });
+        const r = await this.call('transactions/datadecrypt/' + signature, { query: { password } })
+            .catch((e) => (e.code === 24 ? this.call('telegrams/datadecrypt/' + signature, { query: { password } }) : Promise.reject(e)));
         return typeof r === 'string' ? r : r.message ?? JSON.stringify(r);
     }
 

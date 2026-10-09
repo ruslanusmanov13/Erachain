@@ -284,6 +284,7 @@ function createApp(backend, options = {}) {
         }
         if (p === '/api/logout' || ((isClient || isWallet) && p === '/api/session/account')) return;
         if (isWallet && p === '/api/wallet/broadcast') return; // отправитель проверяется в обработчике по подписи
+        if (!isWallet && /^\/api\/tx\/[1-9A-HJ-NP-Za-km-z]+\/decrypt$/.test(p)) return; // свой ли счёт — проверит обработчик
         if (isWallet) throw new BankError('В кошельке на устройстве операции подписываются на телефоне — обновите приложение', 403);
         const rule = CABINET_SIGNER.find(([r]) => (typeof r === 'string' ? r === p : r.test(p)));
         if (!rule || req.method !== 'POST') throw denied();
@@ -315,7 +316,9 @@ function createApp(backend, options = {}) {
         const nums = new Map();
         const ids = [ownerKey.identity(), ...store.data.clients].filter(Boolean);
         for (const id of ids) for (const a of id.accounts || []) nums.set(a.address, a.n);
-        return list.map((a) => ({ ...a, n: nums.get(a.address) || null }));
+        // у кошелька на устройстве номер счёта — его место в сид-фразе (порядок публичных ключей при входе)
+        const own = session.user.role === 'wallet' ? session.scope : null;
+        return list.map((a) => ({ ...a, n: nums.get(a.address) || (own && own.includes(a.address) ? own.indexOf(a.address) + 1 : null) }));
     }
 
     function clientSession(c, walletPassword, keys = null, account = null) {

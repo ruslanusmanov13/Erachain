@@ -252,24 +252,45 @@ export function registerView(onDone) {
     const box = el('div', {});
     const step = (...children) => box.replaceChildren(...children);
 
-    const register = async (seed, name) => {
+    const register = async (seed, name, device, pin) => {
+        if (device) {
+            // кошелёк на устройстве: банку уходят только публичные ключи и подпись
+            const { walletLogin, saveVault } = await import('./wallet/session.js');
+            const { deriveAccounts } = await import('./wallet/keys.js');
+            const r = await walletLogin(deriveAccounts(seed));
+            if (pin) await saveVault(seed, pin);
+            toast('Кошелёк открыт. Ключи — только на этом устройстве');
+            onDone(r.token, '#/keys');
+            return;
+        }
         const r = await post('register', { seed, name });
         toast('Счёт открыт. Добро пожаловать!');
         onDone(r.token, '#/keys');
     };
 
+    const deviceBox = () => el('label', { class: 'check-row' }, el('input', { type: 'checkbox', name: 'device', value: '1' }),
+        el('span', {}, 'Ключи только на этом устройстве — фраза создаётся на телефоне и не отправляется в банк, операции подписываются здесь'));
+
     const start = () => step(
-        el('p', { class: 'muted small' }, 'Создайте счёт в банке: будет сгенерирована сид-фраза и 21 счёт с приватными ключами (стандарт Erachain). Сид-фраза — ваш вход в банк.'),
+        el('p', { class: 'muted small' }, 'Создайте счёт: будет сгенерирована сид-фраза и 21 счёт с приватными ключами (стандарт Erachain). Сид-фраза — ваш вход в банк.'),
         form([
             field('Ваше имя или организация', input('name', { maxlength: 120, autocomplete: 'name', placeholder: 'Необязательно' })),
+            deviceBox(),
         ], 'Создать счёт', async (d) => {
+            if (d.device) {
+                const { generateSeed, deriveAccounts } = await import('./wallet/keys.js');
+                const seed = generateSeed();
+                created(seed, deriveAccounts(seed), d.name.trim(), true);
+                return;
+            }
             const r = await post('register/new');
             created(r.seed, r.keys, d.name.trim());
         }),
         el('p', { class: 'center' }, el('a', { href: '#', class: 'small', onclick: (e) => { e.preventDefault(); own(); } }, 'У меня уже есть сид-фраза Erachain')));
 
-    function created(seed, keys, name) {
+    function created(seed, keys, name, device = false) {
         const agree = el('input', { type: 'checkbox' });
+        const pin = device ? input('pin', { type: 'password', inputmode: 'numeric', autocomplete: 'off', placeholder: '4–12 цифр' }) : null;
         const next = el('button', { class: 'btn primary block', type: 'button', disabled: true }, 'Зарегистрироваться и войти');
         agree.addEventListener('change', () => { next.disabled = !agree.checked; });
         const err = el('p', { class: 'error' });
@@ -277,14 +298,15 @@ export function registerView(onDone) {
             next.disabled = true;
             err.textContent = '';
             try {
-                await register(seed, name);
+                await register(seed, name, device, pin && pin.value.trim());
             } catch (e) {
                 err.textContent = e.message;
                 next.disabled = false;
             }
         });
         step(
-            el('h3', {}, 'Ваш новый счёт'),
+            el('h3', {}, device ? 'Ваш кошелёк на устройстве' : 'Ваш новый счёт'),
+            device ? el('p', { class: 'tiny muted' }, 'Фраза и ключи созданы на этом устройстве. Банк их не получал и восстановить не сможет — сохраните файл.') : null,
             el('div', { class: 'tiny muted' }, 'Сид-фраза'),
             seedBox(seed, { copyable: false }),
             kv([['Основной счёт №1', el('span', { class: 'mono small' }, keys[0].address)]]),
@@ -292,6 +314,7 @@ export function registerView(onDone) {
             el('p', { class: 'tiny muted' }, '«Скачать файлом» — файл с фразой и 21 ключом в «Документы» или «Загрузки». «Сохранить» — на диск, в Telegram или почту. «Копировать фразу» — в буфер обмена.'),
             keysList(keys),
             WARN(true),
+            device ? field('PIN для быстрого входа на этом устройстве (необязательно)', pin, 'Фраза сохранится на телефоне в зашифрованном виде') : null,
             el('label', { class: 'check-row' }, agree, el('span', {}, 'Я сохранил(а) сид-фразу — без неё доступ к счетам не восстановить')),
             err, next,
             el('button', { class: 'btn block', type: 'button', onclick: start }, 'Назад'));
@@ -303,10 +326,51 @@ export function registerView(onDone) {
             form([
                 field('Сид-фраза', seedInput()),
                 field('Ваше имя или организация', input('name', { maxlength: 120, placeholder: 'Необязательно' })),
-            ], 'Зарегистрироваться и войти', async (d) => register(d.seed, d.name.trim())),
+                deviceBox(),
+            ], 'Зарегистрироваться и войти', async (d) => register(d.seed.replace(/\s+/g, ''), d.name.trim(), !!d.device)),
             el('button', { class: 'btn block', type: 'button', onclick: start }, 'Назад'));
     }
 
     start();
     return box;
+}
+
+// ---------- кошелёк на устройстве: разблокировка ----------
+
+/** Кошелёк на устройстве заблокирован (перезагрузка страницы) — попросить PIN или фразу. Возвращает true, если открыт. */
+export async function ensureUnlocked() {
+    const { deviceKeys, vaultInfo, openVault, unlockWithSeed } = await import('./wallet/session.js');
+    const { state } = await import('./state.js');
+    if (!state.me || state.me.user.role !== 'wallet' || deviceKeys()) return true;
+    const first = state.me.user.addresses[0];
+    const vault = vaultInfo();
+    return new Promise((resolve) => {
+        const dialog = document.getElementById('dialog');
+        let done = false;
+        dialog.addEventListener('close', () => resolve(done), { once: true });
+        const usePin = vault && vault.address === first;
+        openDialog(
+            el('h3', {}, 'Разблокировать кошелёк'),
+            el('p', { class: 'small muted' }, usePin ? 'Введите PIN этого устройства — ключи откроются только на телефоне.' : 'Введите сид-фразу кошелька — она останется на этом устройстве.'),
+            form([
+                usePin ? field('PIN', input('pin', { type: 'password', inputmode: 'numeric', autocomplete: 'off', required: true }))
+                    : field('Сид-фраза', seedInput()),
+            ], 'Разблокировать', async (d) => {
+                unlockWithSeed(usePin ? await openVault(d.pin) : d.seed, first);
+                done = true;
+                closeDialog();
+            }),
+            el('button', { class: 'btn block', type: 'button', onclick: closeDialog }, 'Отмена'));
+    });
+}
+
+// подписать на устройстве; если кошелёк заблокирован — разблокировать и повторить
+export async function withDeviceKeys(fn) {
+    try {
+        return await fn();
+    } catch (e) {
+        if (!e.locked) throw e;
+        if (!(await ensureUnlocked())) throw new Error('Кошелёк не разблокирован');
+        return fn();
+    }
 }
