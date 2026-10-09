@@ -1435,3 +1435,71 @@ test('отчёты: сутки → хеш в блокчейне, расписа�
     list = (await call('GET', '/api/reports')).data.reports;
     assert.ok(!('report' in list[0]), 'список без содержимого');
 });
+
+test('залоговое кредитование (Vires): депозит, займ под залог, ставка от загрузки, проценты, здоровье, ликвидация, погашение', async (t) => {
+    const store = new JsonStore(null, {});
+    const { call, accounts, backend } = await startDemo(t, { store });
+    const [main, borrower, depositor, pool, treasury] = accounts.map((a) => a.address);
+    const bal = async (a, k) => Number(((await backend.balances(a)).find((b) => b.asset === k) || { amount: 0 }).amount);
+    for (const a of [pool, treasury]) await call('POST', '/api/transfer', { from: depositor, to: a, asset: 2, amount: '5' });
+    await call('PUT', '/api/mm/settings', { manual: { '1/1048': 10 } });
+    assert.strictEqual((await call('PUT', '/api/lending/settings', { poolAccount: pool, treasuryAccount: pool })).status, 400);
+    assert.strictEqual((await call('PUT', '/api/lending/settings', { poolAccount: pool, quoteAsset: 1048, priceSources: ['manual'] })).status, 200);
+    assert.strictEqual((await call('POST', '/api/lending/pools', { asset: 1, collateralFactor: 0.8, liquidationThreshold: 0.7 })).status, 400);
+    await call('POST', '/api/lending/pools', { asset: 1048, scale: 2 });
+    await call('POST', '/api/lending/pools', { asset: 1, collateralFactor: 0.6, liquidationThreshold: 0.75 });
+
+    // вкладчик кладёт 100 000 ₽-токенов, заёмщик — 100 ERA в залог (по 10 ₽ = 1000 ₽, лимит займа 600)
+    let r = await call('POST', '/api/lending/deposit', { address: depositor, asset: 1048, amount: '100000' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    await call('POST', '/api/lending/deposit', { address: borrower, asset: 1, amount: '100' });
+    assert.strictEqual(await bal(pool, 1), 100);
+    r = await call('POST', '/api/lending/borrow', { address: borrower, asset: 1048, amount: '700' });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.data.error, /Не хватает залога/);
+    r = await call('POST', '/api/lending/borrow', { address: borrower, asset: 1048, amount: '500' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual(r.data.position.hf, 1.5);
+    assert.strictEqual(await bal(borrower, 1048), 500);
+    // загрузка пула и ставки
+    let o = (await call('GET', '/api/lending')).data;
+    const rub = o.pools.find((p) => p.asset === 1048);
+    assert.ok(Math.abs(rub.utilization - 0.005) < 1e-9);
+    assert.ok(Math.abs(rub.borrowApr - (0.02 + 0.1 * 0.005 / 0.8)) < 1e-9);
+    assert.ok(Math.abs(rub.supplyApr - rub.borrowApr * 0.005 * 0.9) < 1e-12);
+    // вывести залог, под которым займ, нельзя
+    assert.strictEqual((await call('POST', '/api/lending/withdraw', { address: borrower, asset: 1, amount: '50' })).status, 400);
+
+    // прошёл год: долг вырос на ставку займа; ERA подешевел до 6 ₽ — позицию можно ликвидировать
+    for (const p of store.data.lendPools) p.updatedAt -= 365 * 86400000;
+    await call('PUT', '/api/mm/settings', { manual: { '1/1048': 6 } });
+    o = (await call('GET', '/api/lending')).data;
+    let pos = o.positions.find((x) => x.address === borrower);
+    const debt = Number(pos.borrow[0].amount);
+    assert.ok(Math.abs(debt - 500 * (1 + rub.borrowApr)) < 0.01, String(debt));
+    assert.strictEqual(pos.state, 'liquidatable');
+    assert.strictEqual((await call('POST', '/api/lending/liquidate', { address: borrower })).status, 400, 'нет казны');
+    await call('PUT', '/api/lending/settings', { treasuryAccount: treasury });
+    await call('POST', '/api/transfer', { from: main, to: treasury, asset: 1048, amount: '1000' });
+    assert.strictEqual((await call('POST', '/api/lending/liquidate', { address: depositor })).status, 400, 'у вкладчика нет долга');
+    r = await call('POST', '/api/lending/liquidate', { address: borrower });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.ok(Math.abs(r.data.repaid - debt / 2) < 0.011);
+    assert.ok(Math.abs(r.data.seized - r.data.repaid * 1.05 / 6) < 1e-6);
+    assert.ok(Math.abs(await bal(treasury, 1) - r.data.seized) < 1e-8);
+    assert.ok(r.data.position.hf > r.data.hfBefore, 'здоровье после ликвидации выше');
+
+    // заёмщик гасит остаток и забирает залог; вкладчик забирает депозит с процентами
+    r = await call('POST', '/api/lending/repay', { address: borrower, asset: 1048, all: true });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.deepStrictEqual(r.data.position.borrow.filter((b) => Number(b.amount) > 0), []);
+    r = await call('POST', '/api/lending/withdraw', { address: borrower, asset: 1, all: true });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    const before = await bal(depositor, 1048);
+    r = await call('POST', '/api/lending/withdraw', { address: depositor, asset: 1048, all: true });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    const got = (await bal(depositor, 1048)) - before;
+    assert.ok(got > 100000 && got < 100000 * (1 + rub.borrowApr), String(got));
+    // доля банка (резерв) осталась в пуле
+    assert.ok(await bal(pool, 1048) > 0);
+});

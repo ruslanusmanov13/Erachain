@@ -287,7 +287,9 @@ export default {
             el('b', {}, 'Кредиты →'), el('span', { class: 'muted' }, 'Договоры с графиком, выдача в долг в блокчейне, погашение и взыскание'));
         const shopLink = el('a', { class: 'menu-tile sbp-link', href: '#/shops' },
             el('b', {}, 'Магазины →'), el('span', { class: 'muted' }, 'Счета продавцов, товары-активы, выдача покупателю после оплаты, контроль COMPU'));
-        return el('div', { class: 'stack' }, el('div', { class: 'grid-2' }, sbpLink, invLink, shopLink, loanLink),
+        const lendLink = el('a', { class: 'menu-tile sbp-link', href: '#/lending' },
+            el('b', {}, 'Залоговые займы →'), el('span', { class: 'muted' }, 'Пулы с депозитами, займы под залог, здоровье позиций и ликвидация'));
+        return el('div', { class: 'stack' }, el('div', { class: 'grid-2' }, sbpLink, invLink, shopLink, loanLink, lendLink),
             el('div', {}, tabs([['statements', 'Выписки'], ['deposits', 'Поступления'], ['withdrawals', 'Вывод'], ['reports', 'Отчёты'], ['settings', 'Шлюз']], mode, show), body));
     },
 };

@@ -17,6 +17,7 @@ const { Loans } = require('./lib/loans');
 const { Merchants } = require('./lib/merchants');
 const { MarketMaker } = require('./lib/marketmaker');
 const { Anchors, canonical } = require('./lib/anchors');
+const { Lending } = require('./lib/lending');
 const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Decode, base58Encode } = require('./lib/seed');
 const { deriveAccounts } = require('./lib/erakeys');
 const { Clients } = require('./lib/clients');
@@ -82,6 +83,8 @@ function createApp(backend, options = {}) {
     }
     // курсы (7Pay, стакан биржи, ручной) и маркет-мейкер на бирже Erachain
     const mm = new MarketMaker(backend, store, { sevenpay: options.sevenpay || null });
+    // залоговое кредитование (Vires): пулы, депозиты, займы под залог, здоровье позиций, ликвидация
+    const lending = new Lending(backend, store, { rate: (q) => mm.rate(q) });
     // отчёты банка: сутки → файл у банка + SHA-256 в блокчейне, цепочка хешей
     const inPeriod = (from, to) => (x) => (x.createdAt || x.ts || 0) >= from && (x.createdAt || x.ts || 0) < to;
     const anchors = new Anchors(backend, store, async (from, to, password) => {
@@ -142,6 +145,8 @@ function createApp(backend, options = {}) {
                     mm.lastTick = Date.now();
                     await mm.tick(staff.walletPassword({ password: null }));
                 }
+                // кредитование: проценты, позиции под угрозой, автоликвидация (если включена)
+                if (staff.shift && store.data.lendPools.some((p) => p.borrowShares > 0)) await lending.tick(staff.walletPassword({ password: null }));
                 // отчёты: по расписанию за прошедшие сутки, хеш — в блокчейн
                 if (staff.shift && anchors.settings().enabled) await anchors.tick(staff.walletPassword({ password: null }));
                 // магазины: выдача товара по оплаченным заказам
@@ -234,6 +239,11 @@ function createApp(backend, options = {}) {
             if (method === 'GET' || ['/api/invoices/find', '/api/invoices/check', '/api/invoices/prepare', '/api/invoices/paid-signed'].includes(pathname)) return ['read'];
             if (pathname === '/api/invoices/cleanup') return ['settings'];
             return pathname === '/api/invoices/settings' ? ['settings'] : ['sign'];
+        }
+        if (pathname.startsWith('/api/lending')) {
+            if (method === 'GET') return ['read'];
+            if (pathname === '/api/lending/settings' || pathname === '/api/lending/pools') return ['settings'];
+            return ['sign'];
         }
         if (pathname.startsWith('/api/reports')) {
             if (method === 'GET' || pathname === '/api/reports/verify') return ['statements'];
@@ -865,6 +875,14 @@ function createApp(backend, options = {}) {
         ['POST', /^\/api\/invoices\/([1-9A-HJ-NP-Za-km-z]{60,100})\/cancel$/, ({ m, session }) => invoices.cancel(m[1], session.password)],
         ['POST', '/api/invoices/cleanup', async ({ req, session }) => invoices.cleanup(session.password, await readJson(req))],
         ['GET', '/api/invoices/paid', () => invoices.paidList()],
+
+        // залоговое кредитование
+        ['GET', '/api/lending', () => lending.overview()],
+        ['PUT', '/api/lending/settings', async ({ req }) => lending.updateSettings(await readJson(req))],
+        ['POST', '/api/lending/pools', async ({ req }) => lending.savePool(await readJson(req))],
+        ['GET', /^\/api\/lending\/positions\/(7[1-9A-HJ-NP-Za-km-z]{32,34})$/, ({ m }) => lending.positionView(m[1])],
+        ...['deposit', 'withdraw', 'borrow', 'repay', 'liquidate'].map((op) => ['POST', '/api/lending/' + op,
+            async ({ req, session }) => lending[op](await readJson(req), session.password, session.user)]),
 
         // отчёты банка с фиксацией хеша в блокчейне
         ['GET', '/api/reports', () => ({ settings: anchors.settings(), reports: anchors.list() })],
