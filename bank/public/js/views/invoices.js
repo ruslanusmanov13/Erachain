@@ -3,7 +3,10 @@ import { el, card, field, input, select, form, tabs, fmt, short, date, kv, empty
 import { accountSelect, can, loadAccounts } from '../state.js';
 
 const CURRS = [{ value: 643, label: 'RUB (643)' }, { value: 840, label: 'USD (840)' }, { value: 978, label: 'EUR (978)' }, { value: 1, label: 'ERA (актив 1)' }, { value: 2, label: 'COMPU (актив 2)' }];
-const ISSUED = { issued: ['ждёт оплаты', 'warn'], partial: ['оплачен частично', 'warn'], paid: ['оплачен', 'ok'], untrusted: ['оплата от недоверенного банка', 'bad'] };
+const ISSUED = {
+    issued: ['ждёт оплаты', 'warn'], pending: ['ждёт подтверждения в сети', 'warn'], partial: ['оплачен частично', 'warn'], paid: ['оплачен', 'ok'],
+    untrusted: ['оплата от недоверенного банка', 'bad'], wrong_asset: ['оплата не той валютой', 'bad'], late: ['оплачен после срока', 'bad'],
+};
 
 let lastUser = '';
 
@@ -17,8 +20,9 @@ function payDialog(inv, reload) {
             ['Назначение', inv.description], ['Реквизиты', inv.details], ['Выставлен', date(inv.date)], ['Действует до', date(inv.expiresAt)],
         ]),
     ];
-    if (inv.paid && inv.paid.status === 'paid') {
-        body.push(badge('оплачен ' + date(inv.paid.paidAt), 'ok'), el('p', { class: 'tiny mono' }, inv.paid.txId));
+    if (inv.paid && ['paid', 'sent'].includes(inv.paid.status)) {
+        body.push(inv.paid.status === 'paid' ? badge('оплачен ' + date(inv.paid.paidAt), 'ok') : badge('перевод отправлен, ждёт подтверждения', 'warn'),
+            el('p', { class: 'tiny mono' }, inv.paid.txId));
     } else if (inv.expired) {
         body.push(el('p', { class: 'note' }, 'Срок счёта истёк — попросите магазин выставить новый.'));
     } else if (can('sign')) {
@@ -29,9 +33,9 @@ function payDialog(inv, reload) {
         ], `Оплатить${needAmount ? '' : ' ' + fmt(inv.sum, 2) + ' ' + inv.currName}`, async (d) => {
             const r = await post('invoices/pay', { signature: inv.signature, user: inv.user, from: d.from, amount: d.amount });
             await loadAccounts();
-            openDialog(el('h3', {}, 'Счёт оплачен'), kv([
+            openDialog(el('h3', {}, r.status === 'paid' ? 'Счёт оплачен' : 'Перевод отправлен'), kv([
                 ['Сумма', `${fmt(r.amount, 2)} ${inv.currName}`], ['Транзакция', el('span', { class: 'mono tiny' }, r.txId)],
-                ['Магазин оповещён', r.callback ? (r.callback.ok ? 'да' : 'нет: ' + (r.callback.error || 'HTTP ' + r.callback.status)) : 'адрес не задан'],
+                ['Магазин', r.callbackUrl ? 'будет оповещён, когда перевод подтвердится в сети' : 'узнает об оплате из блокчейна'],
             ]), el('button', { class: 'btn primary', type: 'button', onclick: () => { closeDialog(); reload(); } }, 'Готово'));
         }, { confirm: (d) => `Оплатить счёт ${inv.order} магазину ${short(inv.shop)} на ${needAmount ? d.amount : fmt(inv.sum, 2)} ${inv.currName}?` }));
     }
@@ -47,7 +51,8 @@ async function payView() {
         try {
             const list = await post('invoices/find', { user });
             results.replaceChildren(list.length ? card(el('div', { class: 'list' }, list.map((inv) => {
-                const state = inv.paid && inv.paid.status === 'paid' ? badge('оплачен', 'ok') : inv.expired ? badge('истёк') : badge('к оплате', 'warn');
+                const state = inv.paid && inv.paid.status === 'paid' ? badge('оплачен', 'ok') : inv.paid && inv.paid.status === 'sent' ? badge('подтверждается', 'warn')
+                    : inv.expired ? badge('истёк') : badge('к оплате', 'warn');
                 const item = el('div', { class: 'list-item clickable' },
                     el('div', { class: 'icon-circle' }, '₽'),
                     el('div', { class: 'grow' }, el('div', { class: 'title' }, inv.title || inv.order),
@@ -111,7 +116,13 @@ async function issuedView() {
         return el('div', { class: 'list-item' }, el('div', { class: 'grow stack' },
             el('div', { class: 'row between' }, el('b', {}, `${inv.order} · ${inv.sum === null ? 'любая сумма' : fmt(inv.sum, 2)}`), badge(label, kind)),
             el('div', { class: 'tiny muted' }, `${date(inv.createdAt)} · покупатель ${inv.user}${inv.paidSum ? ' · получено ' + fmt(inv.paidSum, 2) : ''}`),
-            ...inv.notices.map((n) => el('div', { class: 'tiny ' + (n.trusted ? 'in' : 'out') }, `${n.trusted ? '✓' : '⚠'} ${fmt(n.sum, 2)} от ${short(n.from)}${n.trusted ? '' : ' — банк не в списке доверенных'}`))));
+            ...inv.notices.map((n) => {
+                const problem = !n.trusted ? 'банк не в списке доверенных' : n.assetOk === false ? 'не та валюта' : n.late ? 'после срока счёта'
+                    : n.noticeSum !== null && n.noticeSum !== undefined && n.noticeSum > (n.amount ?? n.sum) ? `в уведомлении ${fmt(n.noticeSum, 2)} — засчитан фактический перевод` : '';
+                const conf = (n.confirmations ?? 1) > 0 ? '' : ' · ждёт подтверждения';
+                return el('div', { class: 'tiny ' + (n.trusted && n.assetOk !== false && !n.late ? 'in' : 'out') },
+                    `${problem ? '⚠' : '✓'} ${fmt(n.amount ?? n.sum, 2)} от ${short(n.from)}${conf}${problem ? ' — ' + problem : ''}`);
+            })));
     }))) : card(empty('Вы ещё не выставляли счета')));
     return box;
 }
@@ -124,13 +135,15 @@ async function settingsView() {
         field('Счёт-канал этого банка', input('channel', { value: s.channel, spellcheck: 'false' }), 'Сюда магазины присылают счета для ваших клиентов'),
         field('Валюты → активы Erachain', input('currencies', { value: curr }), 'ISO-код=номер актива через запятую, например 643=1048'),
         field('Доверенные банки (уведомлениям от них магазин верит)', el('textarea', { name: 'trusted', rows: 3, spellcheck: 'false' }, s.trustedBanks.join('\n'))),
+        field('Подтверждений сети для зачёта оплаты', input('minConfirmations', { type: 'number', min: 0, max: 100, value: String(s.minConfirmations ?? 1) }),
+            'Блок Erachain — около 5 минут. 0 — засчитывать сразу (не рекомендуется)'),
     ], 'Сохранить', async (d) => {
         const currencies = {};
         for (const pair of d.currencies.split(',').map((x) => x.trim()).filter(Boolean)) {
             const [iso, asset] = pair.split('=').map((x) => x.trim());
             currencies[iso] = asset;
         }
-        await put('invoices/settings', { channel: d.channel.trim(), currencies, trustedBanks: d.trusted.split(/[\s,;]+/).filter(Boolean) });
+        await put('invoices/settings', { channel: d.channel.trim(), currencies, trustedBanks: d.trusted.split(/[\s,;]+/).filter(Boolean), minConfirmations: Number(d.minConfirmations) });
         toast('Сохранено');
     }));
 }

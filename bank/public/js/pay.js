@@ -21,11 +21,11 @@ const STEPS = [
 ];
 
 function stepsView(status) {
-    const order = ['SBP_ACTIVE', 'SBP_DONE', 'ERA_QUEUE', 'ERA_SENDING', 'ERA_SEND', 'ERA_DONE'];
+    const order = ['SBP_ACTIVE', 'SBP_DONE', 'ERA_QUEUE', 'ERA_SENDING', 'ERA_MAKE', 'ERA_SEND', 'ERA_DONE'];
     const at = order.indexOf(status);
     return el('ol', { class: 'pay-steps' }, STEPS.map(([key, label]) => {
         const i = order.indexOf(key);
-        return el('li', { class: at > i || status === 'ERA_DONE' ? 'done' : at === i || (key === 'ERA_SEND' && status === 'ERA_SENDING') ? 'now' : '' }, label);
+        return el('li', { class: at > i || status === 'ERA_DONE' ? 'done' : at === i || (key === 'ERA_SEND' && ['ERA_SENDING', 'ERA_MAKE'].includes(status)) ? 'now' : '' }, label);
     }));
 }
 

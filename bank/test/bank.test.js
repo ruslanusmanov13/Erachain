@@ -584,12 +584,19 @@ test('счета на оплату: магазин выставляет, бан�
 
     const shopBefore = backend.accountsMap.get(shop).get(1048) || 0n;
     const paid = await inv.pay({ signature: found[0].signature, user: '79161112233', from: payer }, 'demo12345');
-    assert.strictEqual(paid.status, 'paid');
+    // перевод ушёл, но магазин оповещается только после подтверждения в сети
+    assert.strictEqual(paid.status, 'sent');
+    assert.deepStrictEqual(paid.callback, { state: 'waiting', attempts: 0 });
     assert.strictEqual((backend.accountsMap.get(shop).get(1048) || 0n) - shopBefore, 25050000000n); // 250.5 «цифровых рублей»
     const tx = backend.txs.find((t) => t.signature === paid.txId);
     assert.deepStrictEqual(JSON.parse(tx.message), { orderSignature: found[0].signature, curr: 643, sum: 250.5 });
-    assert.ok(paid.callback && paid.callback.ok === false); // магазин недоступен из теста — оплата всё равно проведена
     await assert.rejects(inv.pay({ signature: found[0].signature, user: '79161112233', from: payer }, 'demo12345'), /уже оплачен/);
+    backend.height += 1;
+    await inv.tick();
+    assert.strictEqual(paid.status, 'paid');
+    assert.ok(paid.seqNo);
+    // магазин недоступен из теста — оплата проведена, обратный вызов будет повторён позже
+    assert.deepStrictEqual([paid.callback.state, paid.callback.attempts, paid.callback.nextAt > Date.now()], ['waiting', 1, true]);
 
     // магазин не доверяет счёту банка — оплата помечается как непроверенная
     let check = await inv.checkIssued('demo12345');
@@ -600,8 +607,24 @@ test('счета на оплату: магазин выставляет, бан�
     await assert.rejects(inv.pay({ signature: second.signature, user: '79161112233', from: payer }, 'demo12345'), /без суммы/);
     await inv.pay({ signature: second.signature, user: '79161112233', from: payer, amount: '100' }, 'demo12345');
     check = await inv.checkIssued('demo12345');
-    const s2 = check.invoices.find((i) => i.order === 'A-2');
+    let s2 = check.invoices.find((i) => i.order === 'A-2');
+    assert.deepStrictEqual([s2.status, s2.paidSum, s2.pendingSum], ['pending', 0, 100]); // ещё не в блоке
+    backend.height += 1;
+    check = await inv.checkIssued('demo12345');
+    s2 = check.invoices.find((i) => i.order === 'A-2');
     assert.deepStrictEqual([s2.status, s2.paidSum], ['paid', 100]);
+
+    // подмена: доверенный банк переводит 1 токен, а в уведомлении пишет «sum: 1000000» — засчитывается 1
+    const big = await inv.issue({ from: shop, user: '79161112233', order: 'BIG', sum: '1000000', curr: 643 }, 'demo12345');
+    await backend.transfer({ from: payer, to: shop, asset: 1048, amount: '1', message: JSON.stringify({ orderSignature: big.signature, curr: 643, sum: 1000000 }) }, 'demo12345');
+    // и «оплата» не той валютой (ERA вместо рубля)
+    const wrong = await inv.issue({ from: shop, user: '79161112233', order: 'WRONG', sum: '5', curr: 643 }, 'demo12345');
+    await backend.transfer({ from: payer, to: shop, asset: 1, amount: '5', message: JSON.stringify({ orderSignature: wrong.signature, curr: 643, sum: 5 }) }, 'demo12345');
+    backend.height += 1;
+    check = await inv.checkIssued('demo12345');
+    const bigInv = check.invoices.find((i) => i.order === 'BIG');
+    assert.deepStrictEqual([bigInv.status, bigInv.paidSum], ['partial', 1]);
+    assert.strictEqual(check.invoices.find((i) => i.order === 'WRONG').status, 'wrong_asset');
 
     // просроченный счёт не оплачивается
     const old = await inv.issue({ from: shop, user: '79161112233', order: 'OLD', sum: '1', expire: 1 }, 'demo12345');
@@ -896,4 +919,79 @@ test('регистрация клиента: своя сид-фраза, 21 сч
     const seed2 = (await api('POST', '/api/register/new')).data.seed;
     r = await api('POST', '/api/register', { seed: seed2 });
     assert.strictEqual(r.status, 423);
+});
+
+test('СБП: двухфазная выплата — ожидание пополнения, повтор без двойного начисления, пачка с «плохим» QR', async () => {
+    const { SbpService, SbpEmulator } = require('../lib/sbp');
+    const backend = new DemoBackend();
+    const store = new JsonStore(null, { sbpSettings: { payoutAccount: backend.mainAccount } });
+    const emu = new SbpEmulator({ acceptAfterMs: 0 });
+    const sbp = new SbpService(emu, backend, store, () => 'demo12345');
+    const client = [...backend.accountsMap.keys()][1];
+    const payout = backend.accountsMap.get(backend.mainAccount);
+
+    // на счёте выплат нет токена 1048 — перевод подписан, но ждёт пополнения (не ошибка)
+    const saved = payout.get(1048);
+    payout.set(1048, 0n);
+    const o = await sbp.createOrder({ receiver: client, amount: '300', asset: 1048 });
+    assert.strictEqual(o.commissionPercent, undefined); // в публичном виде комиссии нет
+    assert.strictEqual(sbp.view(sbp.get(o.id), true).commissionPercent, 0.4);
+    await sbp.tick();
+    let x = sbp.get(o.id);
+    assert.strictEqual(x.status, 'ERA_MAKE');
+    assert.ok(x.txId && x.raw);
+    assert.match(x.message, /Ожидает пополнения/);
+    const sig = x.txId;
+
+    // пополнили — тот же подписанный перевод уходит в сеть, подпись не меняется
+    payout.set(1048, saved);
+    const before = backend.accountsMap.get(client).get(1048) || 0n;
+    await sbp.tick();
+    x = sbp.get(o.id);
+    assert.strictEqual(x.status, 'ERA_SEND');
+    assert.strictEqual(x.txId, sig);
+    assert.strictEqual((backend.accountsMap.get(client).get(1048) || 0n) - before, 30000000000n); // 300 ₽ → 300 токенов
+
+    // повторная отправка той же транзакции нодой отклоняется — второго начисления нет
+    await assert.rejects(backend.broadcast(x.raw), /Invalid timestamp/);
+    Object.assign(x, { status: 'ERA_MAKE' }); // как будто сбой до записи ERA_SEND
+    await sbp.tick();
+    assert.strictEqual(sbp.get(o.id).status, 'ERA_SEND');
+    assert.strictEqual((backend.accountsMap.get(client).get(1048) || 0n) - before, 30000000000n);
+    backend.height += 2;
+    await sbp.tick();
+    x = sbp.get(o.id);
+    assert.deepStrictEqual([x.status, !!x.seqNo, x.raw], ['ERA_DONE', true, null]);
+
+    // подписанный перевод не попал в сеть и истёк — формируется заново, начисление ровно одно
+    const o2 = await sbp.createOrder({ receiver: client, amount: '400', asset: 1048 });
+    payout.set(1048, 0n);
+    await sbp.tick();
+    const lost = sbp.get(o2.id);
+    assert.strictEqual(lost.status, 'ERA_MAKE');
+    const oldSig = lost.txId;
+    lost.makeAt -= 16 * 60000; // прошло больше времени жизни транзакции
+    payout.set(1048, saved);
+    const b2 = backend.accountsMap.get(client).get(1048);
+    await sbp.tick(); // истёкший — в очередь; затем сразу новый перевод
+    await sbp.tick();
+    const re = sbp.get(o2.id);
+    assert.notStrictEqual(re.txId, oldSig);
+    assert.strictEqual(re.status, 'ERA_SEND');
+    assert.strictEqual(backend.accountsMap.get(client).get(1048) - b2, 40000000000n);
+    assert.strictEqual(re.tries, 2);
+
+    // банк отвечает 400 на всю пачку из-за одного «плохого» QR — остальные проверяются по одному
+    const good = await sbp.createOrder({ receiver: client, amount: '500', asset: 1048 });
+    const bad = await sbp.createOrder({ receiver: client, amount: '600', asset: 1048 });
+    sbp.get(bad.id).qrcId = 'BROKEN';
+    const orig = emu.paymentStatuses.bind(emu);
+    emu.paymentStatuses = async (ids) => {
+        if (ids.includes('BROKEN')) throw new v.BankError('СБП: HTTP 400', 502);
+        return orig(ids);
+    };
+    sbp.get(bad.id).expiresAt = Date.now() - 120000;
+    await sbp.tick();
+    assert.notStrictEqual(sbp.get(good.id).status, 'SBP_ACTIVE', 'хороший заказ не застрял');
+    assert.strictEqual(sbp.get(bad.id).status, 'EXPIRED');
 });

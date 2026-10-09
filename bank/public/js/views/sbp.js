@@ -3,7 +3,7 @@ import { el, card, field, input, tabs, fmt, short, date, kv, empty, spinner, toa
 import { state, accountSelect, can } from '../state.js';
 
 const KIND = {
-    SBP_ACTIVE: 'warn', SBP_DONE: 'warn', ERA_QUEUE: 'warn', ERA_SENDING: 'warn', ERA_SEND: 'warn', ERA_DONE: 'ok',
+    SBP_ACTIVE: 'warn', SBP_DONE: 'warn', ERA_QUEUE: 'warn', ERA_SENDING: 'warn', ERA_MAKE: 'warn', ERA_SEND: 'warn', ERA_DONE: 'ok',
     EXPIRED: '', FAIL_MAKE: 'bad', FAIL_SBP: 'bad', FAIL_RATE: 'bad', FAIL_ERA: 'bad',
 };
 
@@ -34,6 +34,9 @@ function orderDialog(o, demo, reload) {
             ['QR (СБП)', o.qrcId ? el('span', { class: 'mono tiny' }, o.qrcId) : null],
             ['Операция СБП', o.trxIdSbp ? el('span', { class: 'mono tiny' }, o.trxIdSbp) : null],
             ['Транзакция Erachain', o.txId ? el('span', { class: 'mono tiny' }, o.txId) : null],
+            ['Блок', o.seqNo || null],
+            ['Комиссия банка', o.commissionPercent !== null && o.commissionPercent !== undefined ? `${o.commissionPercent}% · ≈ ${fmt(o.amountRub * o.commissionPercent / 100, 2)} ₽` : null],
+            ['Попыток начисления', o.tries > 1 ? String(o.tries) : null],
             ['Подтверждений', o.confirmations || null],
             ['Сообщение', o.message],
         ]),

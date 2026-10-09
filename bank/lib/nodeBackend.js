@@ -43,7 +43,9 @@ class NodeBackend {
         }
         if (data && typeof data === 'object' && !Array.isArray(data) && 'error' in data) {
             const msg = data.error_message || data.message || data.error;
-            throw new BankError('Нода: ' + msg + (data.value ? ` (${data.value})` : ''));
+            const err = new BankError('Нода: ' + msg + (data.value ? ` (${data.value})` : ''));
+            err.code = typeof data.error === 'number' ? data.error : null; // код ошибки ноды: 10, 11, 24, 238…
+            throw err;
         }
         if (!res.ok) throw new BankError('Ошибка ноды: HTTP ' + res.status, 502);
         return data;
@@ -187,6 +189,40 @@ class NodeBackend {
             },
         });
         return normalizeTx(tx, t.from);
+    }
+
+    // двухфазная отправка: 1) подписанная транзакция и её подпись — без отправки в сеть
+    async makeTransfer(t, password) {
+        const r = await this.call(`r_send/raw/${t.from}/${t.to}`, {
+            query: {
+                assetKey: t.asset, amount: t.amount, title: t.title, message: t.message,
+                encrypt: t.encrypt || undefined, feePow: 0, encoding: 0, withSign: true, password,
+            },
+        });
+        if (!r || !r.signature || !r.raw) throw new BankError('Нода не вернула подписанную транзакцию (нужна нода с r_send/raw?withSign)');
+        return { signature: r.signature, raw: r.raw };
+    }
+
+    // 2) отправка в сеть; повторная отправка той же транзакции нодой отклоняется — второго платежа не будет
+    async broadcast(raw) {
+        const r = await this.call('record/broadcast', { raw });
+        if (String(r).trim() !== '+') throw new BankError('Нода не приняла транзакцию: ' + String(r).slice(0, 200));
+        return true;
+    }
+
+    // состояние транзакции по подписи: в пуле (0 подтверждений), в блоке или не найдена
+    async txStatus(signature) {
+        try {
+            const tx = await this.call('transactions/signature/' + signature);
+            return {
+                found: true, confirmations: Number(tx.confirmations || 0), height: tx.height ?? null,
+                seqNo: tx.seqNo || (tx.height ? `${tx.height}-${tx.sequence ?? ''}` : null), deadline: tx.deadLine ?? null,
+                from: tx.creator, to: tx.recipient, asset: tx.asset ?? tx.assetKey ?? null, amount: tx.amount ?? null,
+            };
+        } catch (e) {
+            if (e.code === 24) return { found: false };
+            throw e;
+        }
     }
 
     // операции с долгом: выдать (lend) и вернуть (repay) — отрицательный номер актива; взыскать — ещё и backward

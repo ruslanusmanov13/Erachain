@@ -24,6 +24,7 @@ const STATUS = {
     SBP_DONE: 'оплачен по СБП',
     ERA_QUEUE: 'в очереди на начисление',
     ERA_SENDING: 'начисляется',
+    ERA_MAKE: 'перевод подписан, отправляется',
     ERA_SEND: 'отправлено в блокчейн',
     ERA_DONE: 'начислено',
     EXPIRED: 'QR-код истёк',
@@ -238,7 +239,12 @@ class SbpService {
             createdAt: o.createdAt, expiresAt: o.expiresAt || null, txId: o.txId || null, confirmations: o.confirmations || 0,
             message: o.message || null,
         };
-        if (full) Object.assign(v, { trxIdSbp: o.trxIdSbp || null, sbpCode: o.sbpCode || null, source: o.source || 'public', createdBy: o.createdBy || null });
+        if (full) {
+            Object.assign(v, {
+                trxIdSbp: o.trxIdSbp || null, sbpCode: o.sbpCode || null, source: o.source || 'public', createdBy: o.createdBy || null,
+                commissionPercent: o.commissionPercent ?? null, seqNo: o.seqNo || null, tries: o.tries || 0, eraCode: o.eraCode ?? null,
+            });
+        }
         return v;
     }
 
@@ -277,6 +283,11 @@ class SbpService {
                 qrcId: qr.qrcId, payload: qr.payload, image: qr.image ? { mediaType: qr.image.mediaType, content: qr.image.content } : null,
                 status: 'SBP_ACTIVE', expiresAt: Date.now() + s.ttlMinutes * 60000,
             });
+            // комиссия банка за СБП — для отчётов и маржи (как в era-polza-sbp)
+            try {
+                const info = await this.client.qrInfo(qr.qrcId);
+                if (info && info.commissionPercent !== undefined) order.commissionPercent = Number(info.commissionPercent);
+            } catch (e) { /* не критично */ }
         } catch (e) {
             Object.assign(order, { status: 'FAIL_MAKE', message: e.message });
         }
@@ -300,7 +311,7 @@ class SbpService {
         const sum = (f) => orders.filter(f).reduce((acc, o) => acc + o.amountKop, 0) / 100;
         return {
             total: orders.length,
-            paidRub: sum((o) => ['SBP_DONE', 'ERA_QUEUE', 'ERA_SENDING', 'ERA_SEND', 'ERA_DONE'].includes(o.status)),
+            paidRub: sum((o) => ['SBP_DONE', 'ERA_QUEUE', 'ERA_SENDING', 'ERA_MAKE', 'ERA_SEND', 'ERA_DONE'].includes(o.status)),
             creditedRub: sum((o) => o.status === 'ERA_DONE'),
             waiting: orders.filter((o) => o.status === 'SBP_ACTIVE').length,
             queue: orders.filter((o) => ['SBP_DONE', 'ERA_QUEUE'].includes(o.status)).length,
@@ -312,7 +323,10 @@ class SbpService {
     retry(id) {
         const o = this.get(id);
         if (!['FAIL_ERA', 'FAIL_RATE'].includes(o.status)) throw new BankError('Повторить можно только начисление с ошибкой');
-        Object.assign(o, { status: 'ERA_QUEUE', message: null });
+        // если подписанный перевод уже есть — сначала проверяем его по подписи (он мог пройти), иначе формируем заново
+        Object.assign(o, o.txId && o.raw
+            ? { status: 'ERA_SEND', sentAt: o.sentAt || Date.now(), message: null }
+            : { status: 'ERA_QUEUE', txId: null, raw: null, tries: 0, message: null });
         this.store.save();
         return this.view(o, true);
     }
@@ -346,21 +360,34 @@ class SbpService {
     }
 
     async checkPayments() {
-        const active = this.store.data.sbpOrders.filter((o) => o.status === 'SBP_ACTIVE');
-        if (!active.length) return;
-        let list;
+        const now = Date.now();
+        // активные и недавно истёкшие: оплата, начатая до истечения QR, может прийти с опозданием
+        const watch = this.store.data.sbpOrders.filter((o) => o.qrcId && (o.status === 'SBP_ACTIVE'
+            || (o.status === 'EXPIRED' && now - (o.expiresAt || o.createdAt) < LATE_WATCH_MS)));
+        if (!watch.length) return;
+        const statuses = new Map();
         try {
-            list = await this.client.paymentStatuses(active.map((o) => o.qrcId));
+            for (const p of await this.client.paymentStatuses(watch.map((o) => o.qrcId))) statuses.set(p.qrcId, p);
         } catch (e) {
-            return; // банк недоступен — проверим в следующий раз
+            // банк отвечает 400 на всю пачку, если в ней хоть один «плохой» QR — опрашиваем по одному
+            if (e.status === 502 && !/HTTP 400|400/.test(e.message)) return;
+            for (const o of watch) {
+                try {
+                    const [p] = await this.client.paymentStatuses([o.qrcId]);
+                    if (p) statuses.set(o.qrcId, p);
+                } catch (err) {
+                    if (/HTTP 400|400|not found/i.test(err.message)) statuses.set(o.qrcId, { qrcId: o.qrcId, status: 'NotFound' });
+                }
+            }
         }
-        for (const o of active) {
-            const p = list.find((x) => x.qrcId === o.qrcId);
+        for (const o of watch) {
+            const p = statuses.get(o.qrcId);
             if (p && p.status === 'Accepted') {
-                this.save(o, { status: 'SBP_DONE', trxIdSbp: p.trxId || null, sbpCode: p.code || null, paidAt: Date.now() });
+                this.save(o, { status: 'SBP_DONE', trxIdSbp: p.trxId || null, sbpCode: p.code || null, paidAt: now, message: o.status === 'EXPIRED' ? 'Оплата пришла после истечения QR' : null });
             } else if (p && p.status === 'Rejected') {
                 this.save(o, { status: 'FAIL_SBP', message: p.message || 'Оплата отклонена', sbpCode: p.code || null });
-            } else if ((!p || p.status === 'NotStarted') && o.expiresAt && Date.now() > o.expiresAt + 60000) {
+            } else if (o.status === 'SBP_ACTIVE' && o.expiresAt && now > o.expiresAt + 60000
+                && (!p || p.status === 'NotStarted' || p.status === 'NotFound')) {
                 this.save(o, { status: 'EXPIRED' });
             }
         }
@@ -375,10 +402,10 @@ class SbpService {
         return `${o.qrcId}:${o.trxIdSbp || ''}`;
     }
 
-    // незавершённая отправка после сбоя: ищем перевод с меткой заказа в истории счёта выплат
+    // заказы старой схемы (ERA_SENDING без подписи): ищем перевод с меткой заказа в истории счёта выплат
     async recover() {
         const s = this.store.data.sbpSettings;
-        const pending = this.store.data.sbpOrders.filter((o) => o.status === 'ERA_SENDING' && o.recover);
+        const pending = this.store.data.sbpOrders.filter((o) => o.status === 'ERA_SENDING' && !o.txId);
         if (!pending.length) return;
         let history;
         try {
@@ -392,53 +419,102 @@ class SbpService {
         }
     }
 
+    /**
+     * Начисление в две фазы (как в era-polza-sbp):
+     *  1) ERA_QUEUE → ERA_MAKE: нода подписывает перевод, подпись сохраняется ДО отправки;
+     *  2) ERA_MAKE → ERA_SEND: отправка в сеть. Повтор той же транзакции нода отклоняет — двойной выплаты нет.
+     * Транзакция живёт ~9 минут: если по истечении TX_LIFETIME_MS её нет в сети, она уже не пройдёт никогда,
+     * и перевод безопасно формируется заново.
+     */
     async creditQueue() {
         const s = this.store.data.sbpSettings;
-        const queue = this.store.data.sbpOrders.filter((o) => o.status === 'ERA_QUEUE').reverse();
-        if (!queue.length) return;
         let password;
         try {
             password = this.walletPassword();
         } catch (e) {
-            for (const o of queue) if (o.message !== e.message) this.save(o, { message: e.message });
+            for (const o of this.store.data.sbpOrders.filter((x) => x.status === 'ERA_QUEUE')) {
+                if (o.message !== e.message) this.save(o, { message: e.message });
+            }
             return; // смена закрыта — начислим, когда откроют
         }
-        for (const o of queue) {
-            this.save(o, { status: 'ERA_SENDING', recover: false, message: null });
+        for (const o of this.store.data.sbpOrders.filter((x) => x.status === 'ERA_QUEUE').reverse()) {
+            if ((o.tries || 0) >= MAX_TRIES) {
+                this.save(o, { status: 'FAIL_ERA', message: `Перевод не прошёл после ${MAX_TRIES} попыток — нужен разбор` });
+                continue;
+            }
             try {
-                const tx = await this.backend.transfer({
-                    from: s.payoutAccount, to: o.receiver, asset: o.asset, amount: String(o.amountChain),
+                const made = await this.backend.makeTransfer({
+                    from: s.payoutAccount, to: o.receiver, asset: o.asset, amount: Number(o.amountChain).toFixed(o.scale ?? 8),
                     title: 'СБП ' + (o.amountKop / 100).toFixed(2) + ' ₽', message: this.marker(o), encrypt: false,
                 }, password);
-                this.save(o, { status: 'ERA_SEND', txId: tx.signature, sentAt: Date.now() });
+                this.save(o, { status: 'ERA_MAKE', txId: made.signature, raw: made.raw, makeAt: Date.now(), tries: (o.tries || 0) + 1, message: null });
             } catch (e) {
-                // нехватка средств или нода недоступна — повторим; прочие ошибки требуют разбора
-                const retry = e.status === 502 || /недостаточно|not enough|no balance|locked|смена/i.test(e.message);
-                this.save(o, { status: retry ? 'ERA_QUEUE' : 'FAIL_ERA', message: e.message });
-                if (e.status === 502) return;
+                if (e.status === 502) return; // нода недоступна — в следующий раз
+                this.save(o, { status: 'FAIL_ERA', message: e.message, eraCode: e.code ?? null });
+                continue;
             }
+            if ((await this.sendMade(o)) === 'stop') return;
+        }
+        for (const o of this.store.data.sbpOrders.filter((x) => x.status === 'ERA_MAKE')) {
+            if ((await this.sendMade(o)) === 'stop') return;
         }
     }
 
-    async checkConfirmations() {
-        const s = this.store.data.sbpSettings;
-        const sent = this.store.data.sbpOrders.filter((o) => o.status === 'ERA_SEND');
-        if (!sent.length) return;
-        let history;
+    // отправить подписанный перевод; 'stop' — нода недоступна
+    async sendMade(o) {
         try {
-            history = await this.backend.history(s.payoutAccount, 200, this.walletPassword());
+            const st = await this.backend.txStatus(o.txId);
+            if (st.found) {
+                this.save(o, { status: 'ERA_SEND', sentAt: o.sentAt || Date.now(), message: null });
+                return 'ok';
+            }
+            if (Date.now() - o.makeAt > TX_LIFETIME_MS) {
+                this.save(o, { status: 'ERA_QUEUE', txId: null, raw: null, message: 'Перевод не попал в сеть за время жизни — формируем заново' });
+                return 'ok';
+            }
+            await this.backend.broadcast(o.raw);
+            this.save(o, { status: 'ERA_SEND', sentAt: Date.now(), message: null });
         } catch (e) {
-            return;
+            if (e.status === 502) return 'stop';
+            if (WAIT_CODES.has(e.code) || /недостаточно|not enough|no balance/i.test(e.message)) {
+                // не хватает актива или COMPU на счёте выплат — ждём пополнения, подпись та же
+                this.save(o, { message: 'Ожидает пополнения счёта выплат: ' + e.message, eraCode: e.code ?? null });
+            } else if (e.code === 7) {
+                // «Invalid timestamp» — уже в пуле или устарела: решит следующая проверка по подписи
+            } else {
+                this.save(o, { status: 'FAIL_ERA', message: e.message, eraCode: e.code ?? null });
+            }
         }
-        for (const o of sent) {
-            const tx = history.find((t) => t.signature === o.txId);
-            if (tx && tx.confirmations > 0) this.save(o, { status: 'ERA_DONE', confirmations: tx.confirmations, doneAt: Date.now() });
-            else if (!tx && o.sentAt && Date.now() - o.sentAt > 30 * 60000 && !o.message) {
-                // повторно не отправляем автоматически — это могло бы дать двойное начисление
+        return 'ok';
+    }
+
+    async checkConfirmations() {
+        const minConf = this.store.data.sbpSettings.minConfirmations || 1;
+        for (const o of this.store.data.sbpOrders.filter((x) => x.status === 'ERA_SEND')) {
+            let st;
+            try {
+                st = await this.backend.txStatus(o.txId);
+            } catch (e) {
+                return;
+            }
+            if (st.found && st.confirmations >= minConf) {
+                this.save(o, { status: 'ERA_DONE', confirmations: st.confirmations, height: st.height, seqNo: st.seqNo, doneAt: Date.now(), raw: null, message: null });
+            } else if (!st.found && o.raw && Date.now() - (o.makeAt || o.sentAt) > TX_LIFETIME_MS) {
+                // транзакция выпала из пула и истекла — не пройдёт никогда; формируем заново
+                this.save(o, { status: 'ERA_QUEUE', txId: null, raw: null, message: 'Перевод выпал из сети — формируем заново' });
+            } else if (!st.found && !o.raw && o.sentAt && Date.now() - o.sentAt > 30 * 60000 && !o.message) {
+                // старая схема без подписанной копии: повтор мог бы дать двойное начисление — только вручную
                 this.save(o, { message: 'Не подтверждено более 30 минут — проверьте транзакцию в обозревателе' });
             }
         }
     }
 }
+
+// коды ошибок ноды, при которых ждём пополнения: 10 — не хватает на комиссию, 11 — не хватает актива
+const WAIT_CODES = new Set([10, 11]);
+// транзакция Erachain живёт ~9,3 минуты (deadLine); с запасом
+const TX_LIFETIME_MS = 15 * 60000;
+const LATE_WATCH_MS = 24 * 3600000;
+const MAX_TRIES = 5;
 
 module.exports = { SbpService, TochkaSbpClient, SbpEmulator, STATUS, DEFAULT_SETTINGS };

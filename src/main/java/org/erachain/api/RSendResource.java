@@ -256,6 +256,7 @@ public class RSendResource {
                              @QueryParam("message") String message,
                              @QueryParam("encoding") int encoding, @QueryParam("encrypt") boolean encrypt,
                              @QueryParam("rawbase") int rawbase,
+                             @QueryParam("withSign") boolean withSign,
                              @QueryParam("password") String password) {
 
         APIUtils.askAPICallAllowed(password, "GET rawSend\n ", request, true);
@@ -283,11 +284,14 @@ public class RSendResource {
             return out.toJSONString();
         }
 
-        String str;
+        // withSign=true — подписанная транзакция и её подпись: подпись можно сохранить ДО отправки в сеть
+        // (record/broadcast), тогда повторная отправка не создаст второй платёж
+        if (withSign)
+            out.put("signature", Base58.encode(transaction.getSignature()));
         if (rawbase == 64)
-            out.put("raw64", Base64.getEncoder().encodeToString(transaction.toBytes(Transaction.FOR_NETWORK, false)));
+            out.put("raw64", Base64.getEncoder().encodeToString(transaction.toBytes(Transaction.FOR_NETWORK, withSign)));
         else
-            out.put("raw", Base58.encode(transaction.toBytes(Transaction.FOR_NETWORK, false)));
+            out.put("raw", Base58.encode(transaction.toBytes(Transaction.FOR_NETWORK, withSign)));
 
         return out.toJSONString();
 
@@ -339,6 +343,7 @@ public class RSendResource {
         int encoding = Integer.valueOf(jsonObject.getOrDefault("encoding", 0).toString());
         boolean encrypt = Boolean.valueOf((boolean) jsonObject.getOrDefault("encrypt", false));
         int rawbase = Integer.valueOf(jsonObject.getOrDefault("rawbase", 58).toString());
+        boolean withSign = Boolean.valueOf(jsonObject.getOrDefault("withSign", false).toString());
         String password = (String) jsonObject.getOrDefault("password", null);
 
         return rawSendGet(
@@ -350,6 +355,7 @@ public class RSendResource {
                 title, message, encoding,
                 encrypt,
                 rawbase,
+                withSign,
                 password
         );
 

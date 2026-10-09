@@ -19,7 +19,13 @@ const DEFAULT_SETTINGS = {
     channel: '',              // счёт, на который магазины присылают счета для клиентов этого банка
     currencies: { 643: 1048 }, // ISO-код валюты → актив Erachain (643 — рубль → «цифровой рубль»)
     trustedBanks: [],         // счета банков, чьим уведомлениям об оплате магазин доверяет
+    minConfirmations: 1,      // сколько подтверждений сети нужно, чтобы считать оплату состоявшейся
 };
+
+// повторы обратного вызова магазину: через 1, 5, 15, 60, 180 минут
+const CALLBACK_BACKOFF_MIN = [1, 5, 15, 60, 180];
+// транзакция Erachain живёт ~9 минут; не найдена позже — уже не пройдёт
+const TX_LIFETIME_MS = 15 * 60000;
 
 const ISO_NAMES = { 643: 'RUB', 840: 'USD', 978: 'EUR', 156: 'CNY' };
 
@@ -108,6 +114,11 @@ class Invoices {
             }
             s.currencies = map;
         }
+        if (body.minConfirmations !== undefined) {
+            const n = Number(body.minConfirmations);
+            if (!Number.isInteger(n) || n < 0 || n > 100) throw new BankError('Подтверждений: целое число от 0 до 100');
+            s.minConfirmations = n;
+        }
         if (Array.isArray(body.trustedBanks)) {
             const list = body.trustedBanks.map((x) => text(x, 40)).filter(Boolean);
             for (const a of list) if (!isAddress(a)) throw new BankError('Неверный счёт банка: ' + a);
@@ -168,9 +179,15 @@ class Invoices {
         return this.store.data.invoicesIssued;
     }
 
-    // магазин проверяет уведомления об оплате в истории своего счёта
+    /**
+     * Магазин проверяет оплаты в истории своего счёта. Засчитывается только фактический перевод:
+     * сумма — из перевода (не из текста уведомления), актив — валюта счёта, до истечения срока,
+     * от доверенного банка и с нужным числом подтверждений сети.
+     */
     async checkIssued(password) {
-        const trusted = new Set(this.store.data.invoiceSettings.trustedBanks);
+        const settings = this.store.data.invoiceSettings;
+        const trusted = new Set(settings.trustedBanks);
+        const minConf = settings.minConfirmations ?? 1;
         const byShop = new Map();
         for (const inv of this.store.data.invoicesIssued) {
             if (!byShop.has(inv.shop)) byShop.set(inv.shop, []);
@@ -178,7 +195,7 @@ class Invoices {
         }
         let updated = 0;
         for (const [shop, list] of byShop) {
-            const history = await this.backend.history(shop, 200, password);
+            const history = await this.backend.history(shop, 500, password);
             for (const tx of history) {
                 if (tx.direction !== 'in' || !tx.message) continue;
                 let n;
@@ -188,21 +205,46 @@ class Invoices {
                     continue;
                 }
                 const inv = n && list.find((i) => i.signature === n.orderSignature);
-                if (!inv || inv.notices.some((x) => x.signature === tx.signature)) continue;
-                const isTrusted = trusted.has(tx.from);
-                const sum = Number(n.sum ?? tx.amount ?? 0);
-                inv.notices.push({ signature: tx.signature, from: tx.from, sum, trusted: isTrusted, timestamp: tx.timestamp, confirmations: tx.confirmations });
-                if (isTrusted) {
-                    inv.paidSum = Number((inv.paidSum + sum).toFixed(8));
-                    inv.status = inv.sum === null || inv.sum === undefined || inv.paidSum >= inv.sum ? 'paid' : 'partial';
-                } else if (inv.status === 'issued') {
-                    inv.status = 'untrusted';
+                if (!inv) continue;
+                let asset = null;
+                try {
+                    asset = this.assetFor(inv.curr);
+                } catch (e) { /* валюта без актива — оплата не засчитается */ }
+                const notice = {
+                    signature: tx.signature, from: tx.from, trusted: trusted.has(tx.from), timestamp: tx.timestamp,
+                    amount: Number(tx.amount) || 0, noticeSum: n.sum !== undefined ? Number(n.sum) : null,
+                    asset: Number(tx.asset), assetOk: asset !== null && Number(tx.asset) === asset,
+                    late: Boolean(tx.timestamp && inv.expiresAt && tx.timestamp > inv.expiresAt),
+                    confirmations: Number(tx.confirmations) || 0,
+                };
+                const i = inv.notices.findIndex((x) => x.signature === tx.signature);
+                if (i < 0) {
+                    inv.notices.push(notice);
+                    updated += 1;
+                } else if (inv.notices[i].confirmations !== notice.confirmations) {
+                    inv.notices[i] = notice;
+                    updated += 1;
                 }
-                updated += 1;
             }
+            for (const inv of list) this.recompute(inv, minConf);
         }
         this.store.save();
         return { updated, invoices: this.store.data.invoicesIssued };
+    }
+
+    recompute(inv, minConf) {
+        const valid = inv.notices.filter((x) => x.trusted && x.assetOk !== false && !x.late);
+        const confirmed = valid.filter((x) => (x.confirmations ?? 1) >= minConf);
+        inv.paidSum = Number(confirmed.reduce((s, x) => s + (x.amount ?? x.sum ?? 0), 0).toFixed(8));
+        inv.pendingSum = Number(valid.filter((x) => !confirmed.includes(x)).reduce((s, x) => s + (x.amount || 0), 0).toFixed(8));
+        const full = inv.sum === null || inv.sum === undefined ? inv.paidSum > 0 : inv.paidSum >= inv.sum;
+        if (full) inv.status = 'paid';
+        else if (inv.pendingSum > 0) inv.status = 'pending';
+        else if (inv.paidSum > 0) inv.status = 'partial';
+        else if (inv.notices.some((x) => x.trusted && x.assetOk === false)) inv.status = 'wrong_asset';
+        else if (inv.notices.some((x) => x.trusted && x.late)) inv.status = 'late';
+        else if (inv.notices.length) inv.status = 'untrusted';
+        else inv.status = 'issued';
     }
 
     // ---------- банк: найти и оплатить счета клиента ----------
@@ -213,7 +255,7 @@ class Invoices {
         const user = text(body.user, 120);
         if (!user) throw new BankError('Укажите ID клиента: телефон, e-mail или адрес');
         const list = (await this.backend.findTelegrams(channel, user)).map(parseInvoice).filter(Boolean);
-        const paid = new Map(this.store.data.invoicesPaid.map((p) => [p.invoice, p]));
+        const paid = new Map([...this.store.data.invoicesPaid].reverse().map((p) => [p.invoice, p])); // последняя попытка — главная
         return list.map((inv) => ({
             ...inv,
             currName: this.currName(inv.curr),
@@ -226,7 +268,7 @@ class Invoices {
         const signature = text(body.signature, 120);
         const from = text(body.from, 40);
         if (!isAddress(from)) throw new BankError('Выберите счёт для оплаты');
-        if (this.store.data.invoicesPaid.some((p) => p.invoice === signature && p.status !== 'failed')) throw new BankError('Счёт уже оплачен');
+        if (this.store.data.invoicesPaid.some((p) => p.invoice === signature && p.status !== 'failed')) throw new BankError('Счёт уже оплачен (или оплата ждёт подтверждения в сети)');
         const channel = text(body.channel, 40) || this.store.data.invoiceSettings.channel;
         const found = (await this.backend.findTelegrams(channel, text(body.user, 120))).map(parseInvoice).filter(Boolean);
         const inv = found.find((i) => i.signature === signature);
@@ -244,6 +286,7 @@ class Invoices {
         const record = {
             id: crypto.randomUUID(), invoice: signature, order: inv.order, shop: inv.shop, from, amount, curr: inv.curr, asset,
             status: 'paying', createdAt: Date.now(), by: user ? user.login : null,
+            callbackUrl: inv.callback || null, callback: inv.callback ? { state: 'waiting', attempts: 0 } : null,
         };
         this.store.data.invoicesPaid.unshift(record);
         this.store.save();
@@ -253,17 +296,62 @@ class Invoices {
             const tx = await this.backend.transfer({
                 from, to: inv.shop, asset, amount: String(amount), title: '', message: JSON.stringify(notice), encrypt: false,
             }, password);
-            Object.assign(record, { status: 'paid', txId: tx.signature, paidAt: Date.now() });
+            // «отправлен»: магазин оповещается, когда перевод наберёт нужное число подтверждений (tick)
+            Object.assign(record, { status: 'sent', txId: tx.signature, paidAt: Date.now() });
         } catch (e) {
             Object.assign(record, { status: 'failed', error: e.message });
             this.store.save();
             throw e;
         }
-        if (inv.callback) {
-            record.callback = await safeCallback(inv.callback, record.txId);
-        }
         this.store.save();
+        await this.tick().catch(() => {}); // при 0 подтверждений в настройках — оповестить сразу
         return record;
+    }
+
+    /**
+     * Фоновая проверка оплат банка: подтверждение перевода по подписи → «оплачен» → обратный вызов магазину
+     * с повторами. Перевод, не попавший в сеть за время жизни транзакции, помечается «не прошёл» — его можно
+     * оплатить заново (двойной оплаты не будет: старая транзакция уже не пройдёт).
+     */
+    async tick() {
+        const minConf = this.store.data.invoiceSettings.minConfirmations ?? 1;
+        const now = Date.now();
+        let changed = false;
+        for (const r of this.store.data.invoicesPaid) {
+            if (r.status === 'sent' && r.txId && this.backend.txStatus) {
+                let st;
+                try {
+                    st = await this.backend.txStatus(r.txId);
+                } catch (e) {
+                    break; // нода недоступна
+                }
+                if (st.found && st.confirmations >= minConf) {
+                    Object.assign(r, { status: 'paid', confirmations: st.confirmations, seqNo: st.seqNo || null, confirmedAt: now });
+                    changed = true;
+                } else if (!st.found && now - r.paidAt > TX_LIFETIME_MS) {
+                    Object.assign(r, { status: 'failed', error: 'Перевод не попал в сеть — оплатите счёт заново' });
+                    changed = true;
+                }
+            } else if (r.status === 'sent' && !this.backend.txStatus) {
+                r.status = 'paid';
+                changed = true;
+            }
+            if (r.status === 'paid' && r.callback && r.callback.state === 'waiting' && (!r.callback.nextAt || now >= r.callback.nextAt)) {
+                const res = await safeCallback(r.callbackUrl, r.txId);
+                r.callback.attempts += 1;
+                Object.assign(r.callback, { status: res.status ?? null, error: res.error || null, lastAt: now });
+                if (res.ok) {
+                    r.callback.state = 'done';
+                } else if (r.callback.attempts >= CALLBACK_BACKOFF_MIN.length) {
+                    r.callback.state = 'failed';
+                } else {
+                    r.callback.nextAt = now + CALLBACK_BACKOFF_MIN[r.callback.attempts - 1] * 60000;
+                }
+                changed = true;
+            }
+        }
+        if (changed) this.store.save();
+        return { changed };
     }
 
     paidList() {

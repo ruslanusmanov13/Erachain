@@ -76,6 +76,21 @@ function createApp(backend, options = {}) {
         const timer = setInterval(() => sbp.tick().catch((e) => console.error('sbp:', e.message)), options.sbpIntervalMs || 4000);
         if (timer.unref) timer.unref();
     }
+    // счета на оплату: подтверждение своих оплат и обратные вызовы магазинам; входящие оплаты — при открытой смене
+    if (options.jobsIntervalMs !== 0) {
+        const timer = setInterval(async () => {
+            try {
+                await invoices.tick();
+                if (staff.shift && store.data.invoicesIssued.some((i) => !['paid'].includes(i.status))) {
+                    await invoices.checkIssued(staff.walletPassword({ password: null }));
+                }
+            } catch (e) {
+                if (e.status !== 502) console.error('invoices:', e.message);
+            }
+        }, options.jobsIntervalMs || 20000);
+        if (timer.unref) timer.unref();
+    }
+
     // ограничение публичного создания QR: не больше 10 заказов за 10 минут с одного адреса
     const publicHits = new Map();
     function publicLimit(ip) {

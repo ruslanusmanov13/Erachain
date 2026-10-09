@@ -296,6 +296,43 @@ class DemoBackend {
         return (await this.history(t.from, 50)).find((x) => x.signature === tx.signature);
     }
 
+    // двухфазная отправка (как у ноды): подпись без исполнения, затем отправка; повтор отклоняется
+    async makeTransfer(t, password) {
+        this.check(password);
+        if (!this.assetsMap.has(Number(t.asset))) throw new BankError('Нода: Asset does not exist');
+        this.own(t.from);
+        const signature = base58(crypto.randomBytes(64));
+        this.pendingRaw = this.pendingRaw || new Map();
+        this.pendingRaw.set(signature, { t: { ...t }, makeAt: Date.now() });
+        return { signature, raw: signature };
+    }
+
+    async broadcast(raw) {
+        const p = this.pendingRaw && this.pendingRaw.get(raw);
+        if (!p || p.sent) {
+            const err = new BankError('Нода: Invalid timestamp');
+            err.code = 7;
+            throw err;
+        }
+        const { t } = p;
+        try {
+            this.move(t.from, t.to, Number(t.asset), t.amount);
+        } catch (e) {
+            e.code = /COMPU/.test(e.message) ? 10 : 11;
+            throw e;
+        }
+        p.sent = true;
+        const tx = this.record('transfer', { typeName: 'Перевод', from: t.from, to: t.to, asset: Number(t.asset), amount: t.amount, title: t.title, message: t.message });
+        tx.signature = raw;
+        return true;
+    }
+
+    async txStatus(signature) {
+        const tx = this.txs.find((x) => x.signature === signature);
+        if (!tx) return { found: false };
+        return { found: true, confirmations: this.confirmations(tx), height: tx.height, seqNo: tx.seqNo, deadline: tx.timestamp + 560000, from: tx.from, to: tx.to, asset: tx.asset, amount: tx.amount };
+    }
+
     // долг в демо: выдача уменьшает собственность кредитора и увеличивает у заёмщика, учёт долга отдельно
     async debtTransfer(t, password) {
         this.check(password);
