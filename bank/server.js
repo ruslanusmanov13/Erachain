@@ -261,7 +261,7 @@ function createApp(backend, options = {}) {
         if (!origin || !corsOrigins.has(origin)) return {};
         return {
             'Access-Control-Allow-Origin': origin,
-            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-File-As',
             'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, OPTIONS',
             'Access-Control-Expose-Headers': 'Content-Disposition',
             Vary: 'Origin',
@@ -291,6 +291,10 @@ function createApp(backend, options = {}) {
             status = e instanceof BankError ? e.status : 500;
             body = { error: e instanceof BankError ? e.message : 'Внутренняя ошибка сервера' };
             if (!(e instanceof BankError)) console.error(e);
+        }
+        if (body && body.file && req.headers['x-file-as'] === 'json') {
+            // для мобильного приложения: файл в base64 внутри JSON (нативный HTTP не искажает двоичные данные)
+            body = { filename: body.filename, mime: body.mime, base64: body.content.toString('base64') };
         }
         if (body && body.file) {
             res.writeHead(200, {

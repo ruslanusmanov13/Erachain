@@ -1,0 +1,10 @@
+{
+  "name": "Банк Erachain",
+  "short_name": "Erachain",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f2f4f8",
+  "theme_color": "#1f5eff",
+  "lang": "ru",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
