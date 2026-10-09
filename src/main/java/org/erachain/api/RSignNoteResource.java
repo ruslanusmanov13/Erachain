@@ -79,7 +79,7 @@ public class RSignNoteResource {
                         "templateKey:long, " +
                         "templateParams: { param:Value, ..}, " +
                         "templateUnique:false," +
-                        "hashes: { path:HASH, ..}, " +
+                        "hashes: { HASH_Base58:description, ..}, " +
                         "hashesUnique:false," +
                         "files: [ { name:Path, zip:false, data:bytes.UTF-8 }, ..]" +
                         "filesUnique:false," +
@@ -208,8 +208,8 @@ public class RSignNoteResource {
         if (recipientsJson == null) {
             recipients = null;
         } else {
-            onlyRecipients = Boolean.valueOf((boolean) jsonObject.getOrDefault("onlyRecipients", false));
-            JSONArray recipientsArray = (JSONArray) jsonObject.get("list");
+            onlyRecipients = Boolean.valueOf((boolean) recipientsJson.getOrDefault("onlyRecipients", false));
+            JSONArray recipientsArray = (JSONArray) recipientsJson.get("list");
             if (recipientsArray == null) {
                 JSONObject out = new JSONObject();
                 Transaction.updateMapByErrorSimple(Transaction.INVALID_RECEIVERS_LIST, out);
@@ -320,11 +320,9 @@ public class RSignNoteResource {
         boolean filesUnique = Boolean.valueOf((boolean) jsonObject.getOrDefault("filesUnique", false));
 
         PrivateKeyAccount privateKeyAccount;
-        if (!test) {
-            // так как тут может очень долго работать то откроем на долго
-            APIUtils.askAPICallAllowed(password, "GET RSignNote\n ", request, false);
-
-        }
+        // так как тут может очень долго работать то откроем на долго
+        // (ключ нужен и для тестового прогона - он подписывает транзакцию)
+        APIUtils.askAPICallAllowed(password, "GET RSignNote\n ", request, false);
 
         Controller cntr = Controller.getInstance();
         BlockChain chain = cntr.getBlockChain();
@@ -368,6 +366,8 @@ public class RSignNoteResource {
             int validate = cntr.getTransactionCreator().afterCreate(issueDoc, Transaction.FOR_NETWORK, tryFree, test);
 
             if (validate == Transaction.VALIDATE_OK) {
+                if (!test)
+                    return issueDoc.toJson().toJSONString();
                 out.put("status", "TEST");
                 return out.toJSONString();
             } else {

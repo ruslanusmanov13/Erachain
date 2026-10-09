@@ -28,6 +28,7 @@ import javax.ws.rs.*;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -47,16 +48,16 @@ public class ItemPollsResource {
         Map help = new LinkedHashMap();
 
         help.put("polls/last", "Get last key");
-        help.put("polls/{key}", "Returns information about poll with the given key.");
+        help.put("polls/{key}?asset={assetKey}", "Returns information about poll with the given key and results by options (votes weighted by balance of asset, default 1 - ERA).");
         help.put("polls/raw/{key}", "Returns RAW in Base58 of poll with the given key.");
         help.put("polls/images/{key}", "get item Images by key");
         help.put("polls/listfrom/{start}", "get list from KEY");
         help.put("GET polls/issue {\"creator\":\"<creatorAddress>\", \"linkTo\":\"<SeqNo>\",  \"name\":\"<name>\", \"description\":\"<description>\", \"options\": [<optionOne>, <optionTwo>], \"feePow\":\"<feePow>\"}", "issue");
-        help.put("POST polls/issue {\"creator\":\"<creatorAddress>\", \"linkTo\":\"<SeqNo>\", \"name\":\"<name>\", \"description\":\"<description>\", \"options\": [<optionOne>, <optionTwo>], \"feePow\":\"<feePow>\"}", "Used to create a new poll. Returns the transaction in JSON when successful.");
+        help.put("POST polls/issue {\"creator\":\"<creatorAddress>\", \"linkTo\":\"<SeqNo>\", \"name\":\"<name>\", \"description\":\"<description>\", \"options\": [<optionOne>, <optionTwo>], \"feePow\":\"<feePow>\", \"password\":\"<password>\"}", "Used to create a new poll. Returns the transaction in JSON when successful.");
         help.put("POST polls/issueraw/{creator} {\"linkTo\":<SeqNo>, \"feePow\":<int>, \"password\":<String>, \"linkTo\":<SeqNo>, \"raw\":RAW-Base58", "Issue Poll by Base58 RAW in POST body");
 
-        help.put("polls/vote/{key}/{option}/{voter}?feePow=feePow", "Used to vote on a poll with the given KEY. Returns the transaction in JSON when successful.");
-        help.put("POST polls/vote/{key} {\"voter\":\"<voterAddress>\", \"option\": \"<optionOne>\", \"feePow\":\"<feePow>\"}", "Used to vote on a poll with the given KEY. Returns the transaction in JSON when successful.");
+        help.put("polls/vote/{key}/{option}/{voter}?feePow=feePow&password=password", "Used to vote on a poll with the given KEY. Returns the transaction in JSON when successful.");
+        help.put("POST polls/vote/{key} {\"voter\":\"<voterAddress>\", \"option\": <optionIndex>, \"feePow\":\"<feePow>\", \"password\":\"<password>\"}", "Used to vote on a poll with the given KEY. Returns the transaction in JSON when successful.");
 
         help.put("polls/address/{address}", "Returns an array of all the polls owned by a specific address in your wallet.");
 
@@ -77,7 +78,7 @@ public class ItemPollsResource {
      */
     @GET
     @Path("/{key}")
-    public String get(@PathParam("key") String key) {
+    public String get(@PathParam("key") String key, @DefaultValue("1") @QueryParam("asset") long assetKey) {
         Long asLong = null;
 
         try {
@@ -95,7 +96,26 @@ public class ItemPollsResource {
 
         }
 
-        return Controller.getInstance().getPoll(asLong).toJson().toJSONString();
+        PollCls poll = Controller.getInstance().getPoll(asLong);
+        JSONObject json = poll.toJson();
+
+        // results by options: persons count and votes weighted by balance of the asset
+        Fun.Tuple4<Integer, long[], BigDecimal, BigDecimal[]> votes = poll.votesWithPersons(DCSet.getInstance(), assetKey, 0);
+        JSONArray results = new JSONArray();
+        for (int i = 0; i < votes.b.length; i++) {
+            JSONObject option = new JSONObject();
+            option.put("option", i);
+            option.put("name", poll.getOptions().get(i));
+            option.put("persons", votes.b[i]);
+            option.put("votes", votes.d[i].toPlainString());
+            results.add(option);
+        }
+        json.put("results", results);
+        json.put("resultsAsset", assetKey);
+        json.put("personsTotal", votes.a);
+        json.put("votesTotal", votes.c.toPlainString());
+
+        return json.toJSONString();
     }
 
     @GET
@@ -176,19 +196,20 @@ public class ItemPollsResource {
     @Path("issue")
     public String issuePoll(String poll) {
 
-        String password = null;
-        APIUtils.askAPICallAllowed(password, "POST polls " + poll, request, true);
-
         try {
             //READ JSON
             JSONObject jsonObject = (JSONObject) JSONValue.parse(poll);
+            String password = (String) jsonObject.get("password");
+            APIUtils.askAPICallAllowed(password, "POST polls " + jsonObject.get("name"), request, true);
+
             String creator = (String) jsonObject.get("creator");
             String name = (String) jsonObject.get("name");
             String description = (String) jsonObject.get("description");
             JSONArray optionsJSON = (JSONArray) jsonObject.get("options");
-            String feePowStr = (String) jsonObject.get("feePow");
+            String feePowStr = String.valueOf(jsonObject.getOrDefault("feePow", 0));
 
-            String linkToRefStr = jsonObject.get("linkTo").toString();
+            Object linkToObj = jsonObject.get("linkTo");
+            String linkToRefStr = linkToObj == null ? null : linkToObj.toString();
             ExLink linkTo;
             if (linkToRefStr == null)
                 linkTo = null;
@@ -250,13 +271,16 @@ public class ItemPollsResource {
             //VALIDATE AND PROCESS
             int validate = controller.getTransactionCreator().afterCreate(issue_voiting, Transaction.FOR_NETWORK, false, false);
             if (validate == Transaction.VALIDATE_OK)
-                return "ok";
+                return issue_voiting.toJson().toJSONString();
+
+            JSONObject out = new JSONObject();
+            Transaction.updateMapByErrorSimple(validate, out);
+            return out.toJSONString();
         } catch (NullPointerException | ClassCastException e) {
             //JSON EXCEPTION
             LOGGER.error(e.getMessage());
             throw ApiErrorFactory.getInstance().createError(ApiErrorFactory.ERROR_JSON);
         }
-        return "ok";
     }
 
     /**
@@ -393,15 +417,20 @@ public class ItemPollsResource {
     @Consumes(MediaType.WILDCARD)
     public Response createPollVote(String x, @PathParam("key") Long key) {
 
-        String password = null;
-        APIUtils.askAPICallAllowed(password, "POST polls/vote/" + key + "\n" + x, request, true);
-
         try {
             //READ JSON
             JSONObject jsonObject = (JSONObject) JSONValue.parse(x);
+            String password = (String) jsonObject.get("password");
+            APIUtils.askAPICallAllowed(password, "POST polls/vote/" + key, request, true);
+
             String voter = (String) jsonObject.get("voter");
-            Integer option = (Integer) jsonObject.get("option");
-            String feePowStr = (String) jsonObject.get("feePow");
+            int option;
+            try {
+                option = Integer.parseInt(jsonObject.get("option").toString());
+            } catch (NumberFormatException e) {
+                throw ApiErrorFactory.getInstance().createError(Transaction.POLL_OPTION_NOT_EXISTS);
+            }
+            String feePowStr = String.valueOf(jsonObject.getOrDefault("feePow", 0));
 
             //PARSE FEE
             int feePow;
@@ -440,8 +469,7 @@ public class ItemPollsResource {
             }
 
             //GET OPTION
-            String pollOption = poll.getOptions().get(option);
-            if (pollOption == null) {
+            if (option < 0 || option >= poll.getOptions().size()) {
                 throw ApiErrorFactory.getInstance().createError(Transaction.POLL_OPTION_NOT_EXISTS);
             }
 
@@ -476,11 +504,13 @@ public class ItemPollsResource {
     @Path("vote/{key}/{option}/{voter}")
     public Response createPollVoteGet(@PathParam("key") long pollKey, @PathParam("option") int option,
                                       @PathParam("voter") String voter,
-                                      @QueryParam("feePow") Integer feePow
+                                      @QueryParam("feePow") Integer feePow,
+                                      @QueryParam("password") String password
     ) {
 
-        String password = null;
         APIUtils.askAPICallAllowed(password, "GET polls/vote/" + pollKey + "\n", request, true);
+        if (feePow == null)
+            feePow = 0;
 
         //CHECK VOTERa
         if (!Crypto.getInstance().isValidAddress(voter))
@@ -501,8 +531,7 @@ public class ItemPollsResource {
             throw ApiErrorFactory.getInstance().createError(Transaction.POLL_NOT_EXISTS);
 
         //GET OPTION
-        String pollOption = poll.getOptions().get(option);
-        if (pollOption == null)
+        if (option < 0 || option >= poll.getOptions().size())
             throw ApiErrorFactory.getInstance().createError(Transaction.POLL_OPTION_NOT_EXISTS);
 
         //CREATE POLL

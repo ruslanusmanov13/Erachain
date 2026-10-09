@@ -3299,8 +3299,9 @@ public class Controller extends Observable {
         JSONObject jsonObject = resultHead.e;
 
         if (jsonObject == null) {
-            int error = ApiErrorFactory.ERROR_JSON;
-            return new Fun.Tuple2<>(error, OnDealClick.resultMess(error));
+            JSONObject out = new JSONObject();
+            Transaction.updateMapByErrorSimple(ApiErrorFactory.ERROR_JSON, out);
+            return out;
         }
 
         String name = (String) jsonObject.get("name");
@@ -3330,27 +3331,32 @@ public class Controller extends Observable {
             image = java.util.Base64.getDecoder().decode(image64);
         }
 
-        Integer scale = null;
-        Integer assetType = null;
-        Long quantity = null;
-        int error;
+        // JSON numbers are parsed as Long, and clients may also send them as strings
+        int scale;
+        int assetType;
+        long quantity;
         String errorName = null;
         try {
             errorName = "scale: -8...24";
-            scale = (Integer) jsonObject.getOrDefault("scale", 0);
+            scale = Integer.parseInt(jsonObject.getOrDefault("scale", 0).toString());
             errorName = "assetType: int";
-            assetType = (Integer) jsonObject.getOrDefault("assetType", 0);
+            assetType = Integer.parseInt(jsonObject.getOrDefault("assetType", 0).toString());
             errorName = "quantity: long";
-            quantity = (Long) jsonObject.getOrDefault("quantity", 0L);
+            quantity = Long.parseLong(jsonObject.getOrDefault("quantity", 0L).toString());
         } catch (Exception e) {
-            error = ApiErrorFactory.ERROR_JSON;
             JSONObject out = new JSONObject();
-            out.put("error", error);
+            out.put("error", ApiErrorFactory.ERROR_JSON);
             out.put("error_message", errorName);
+            return out;
         }
 
         APIUtils.askAPICallAllowed(password, "POST issue Asset " + name, request, true);
         PrivateKeyAccount creatorPrivate = getWalletPrivateKeyAccountByAddress(creator);
+        if (creatorPrivate == null) {
+            JSONObject out = new JSONObject();
+            Transaction.updateMapByErrorSimple(Transaction.INVALID_CREATOR, out);
+            return out;
+        }
 
         int profitTaxMin = 0;
         int profitTaxMax = 0;
