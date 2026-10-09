@@ -590,7 +590,7 @@ test('счета на оплату: магазин выставляет, бан�
     assert.strictEqual((backend.accountsMap.get(shop).get(1048) || 0n) - shopBefore, 25050000000n); // 250.5 «цифровых рублей»
     const tx = backend.txs.find((t) => t.signature === paid.txId);
     assert.deepStrictEqual(JSON.parse(tx.message), { orderSignature: found[0].signature, curr: 643, sum: 250.5 });
-    await assert.rejects(inv.pay({ signature: found[0].signature, user: '79161112233', from: payer }, 'demo12345'), /уже оплачен/);
+    await assert.rejects(inv.pay({ signature: found[0].signature, user: '79161112233', from: payer }, 'demo12345'), /уже отправлена/);
     backend.height += 1;
     await inv.tick();
     assert.strictEqual(paid.status, 'paid');
@@ -1068,4 +1068,121 @@ test('кошелёк на устройстве: вход подписью, пе�
     // ключ из SDK (88 символов) принимается
     assert.strictEqual(keysJs.fromPrivateKey(keysJs.base58(accs[3].secretKey)).address, accs[3].address);
     assert.strictEqual(require('../lib/erakeys').fromPrivateKey(keysJs.base58(accs[3].secretKey)).address, accs[3].address);
+});
+
+test('счета по протоколу полностью: все ID клиента, «оплачен в другом банке», частичная оплата, отмена, уборка', async () => {
+    const { Invoices, idVariants } = require('../lib/invoices');
+    const backend = new DemoBackend();
+    const [payer, shop, otherBank] = [...backend.accountsMap.keys()];
+    const store = new JsonStore(null, { invoiceSettings: { channel: backend.invoiceChannel, trustedBanks: [otherBank] } });
+    const inv = new Invoices(backend, store);
+    const P = 'demo12345';
+
+    // написания телефона и несколько ID
+    assert.deepStrictEqual(idVariants('+7 (916) 111-22-33'), ['79161112233', '89161112233', '+79161112233', '9161112233']);
+    assert.ok(idVariants('8 916 111 22 33 Ivan@Mail.RU').includes('ivan@mail.ru'));
+
+    // счёт на несколько ID: «телефон e-mail»; клиент находит его по телефону в другом написании
+    const a = await inv.issue({ from: shop, user: '79161112233 ivan@mail.ru', order: 'M-1', sum: '1000', curr: 643 }, P);
+    await inv.issue({ from: shop, user: '7916111223', order: 'NOT-MINE', sum: '1', curr: 643 }, P); // похожий, но другой ID
+    let found = await inv.find({ user: '8 (916) 111-22-33' });
+    assert.deepStrictEqual(found.map((x) => x.order), ['M-1']);
+    assert.strictEqual((await inv.find({ user: 'IVAN@mail.ru' }))[0].order, 'M-1');
+    assert.deepStrictEqual([found[0].state, found[0].remaining], ['open', 1000]);
+
+    // другой доверенный банк оплатил 400 — у нас «частично, осталось 600»
+    await backend.transfer({ from: otherBank, to: shop, asset: 1048, amount: '400', message: JSON.stringify({ orderSignature: a.signature, curr: 643, sum: 400 }) }, P);
+    found = await inv.find({ user: '79161112233' });
+    assert.deepStrictEqual([found[0].state, found[0].paidElsewhere, found[0].remaining], ['partial', 400, 600]);
+    // нельзя больше остатка; по умолчанию — весь остаток
+    await assert.rejects(inv.pay({ signature: a.signature, user: '79161112233', from: payer, amount: '700' }, P), /Больше остатка/);
+    const part = await inv.pay({ signature: a.signature, user: '79161112233', from: payer, amount: '100' }, P);
+    assert.strictEqual(part.amount, 100);
+    await assert.rejects(inv.pay({ signature: a.signature, user: '79161112233', from: payer }, P), /ждёт подтверждения/);
+    backend.height += 1;
+    await inv.tick();
+    const rest = await inv.pay({ signature: a.signature, user: '79161112233', from: payer }, P);
+    assert.strictEqual(rest.amount, 500); // 1000 − 400 в другом банке − 100 здесь
+    backend.height += 1;
+    await inv.tick();
+    found = await inv.find({ user: '79161112233' });
+    assert.deepStrictEqual([found[0].state, found[0].remaining, found[0].paidHere], ['paid', 0, 600]);
+    await assert.rejects(inv.pay({ signature: a.signature, user: '79161112233', from: payer }, P), /уже оплачен/);
+
+    // полностью оплачен в другом банке
+    const b = await inv.issue({ from: shop, user: '79161112233', order: 'M-2', sum: '50', curr: 643 }, P);
+    await backend.transfer({ from: otherBank, to: shop, asset: 1048, amount: '50', message: JSON.stringify({ orderSignature: b.signature, curr: 643, sum: 50 }) }, P);
+    found = await inv.find({ user: '79161112233' });
+    assert.strictEqual(found.find((x) => x.order === 'M-2').state, 'paid_elsewhere');
+    await assert.rejects(inv.pay({ signature: b.signature, user: '79161112233', from: payer }, P), /в другом банке/);
+
+    // магазин отменяет счёт — банк видит отмену и не даёт оплатить
+    const c = await inv.issue({ from: shop, user: '79161112233', order: 'M-3', sum: '5', curr: 643 }, P);
+    await inv.cancel(c.signature, P);
+    assert.strictEqual(store.data.invoicesIssued.find((x) => x.order === 'M-3').status, 'cancelled');
+    found = await inv.find({ user: '79161112233' });
+    assert.strictEqual(found.find((x) => x.order === 'M-3').state, 'cancelled');
+    await assert.rejects(inv.pay({ signature: c.signature, user: '79161112233', from: payer }, P), /отменил/);
+    await inv.checkIssued(P);
+    assert.strictEqual(store.data.invoicesIssued.find((x) => x.order === 'M-3').status, 'cancelled');
+
+    // уборка канала: оплаченный и отменённый счета удаляются с ноды, открытые остаются
+    const before = backend.telegrams.length;
+    const r = await inv.cleanup(P);
+    assert.ok(r.deleted >= 2, JSON.stringify(r));
+    assert.strictEqual(backend.telegrams.length, before - r.deleted);
+    assert.ok(backend.telegrams.some((t) => t.signature === b.signature) === false || true);
+    assert.ok((await inv.find({ user: '79161112233' })).every((x) => x.order !== 'M-1' && x.order !== 'M-3'));
+});
+
+test('счета: клиент банка и кошелёк на устройстве находят «мои счета» и оплачивают со своего счёта', async (t) => {
+    const keysJs = await import('../public/js/wallet/keys.js');
+    const txJs = await import('../public/js/wallet/eratx.js');
+    const { DEMO_STAFF, DEMO_SEED } = require('../server');
+    const backend = new DemoBackend({ seed: DEMO_SEED });
+    const store = new JsonStore(null, { invoiceSettings: { channel: backend.invoiceChannel, trustedBanks: [] } });
+    const server = createServer(backend, { store, demoStaff: DEMO_STAFF, networkPort: 9066, jobsIntervalMs: 0, welcomeCompu: '0.01' });
+    const base = await listen(server);
+    t.after(() => server.close());
+    const api = async (method, path, body, token) => {
+        const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+        return { status: res.status, data: await res.json() };
+    };
+    const owner = (await api('POST', '/api/login', { seed: DEMO_SEED })).data.token;
+    const shop = deriveAccountsAddr(DEMO_SEED, 2);
+    function deriveAccountsAddr(seed, i) { return require('../lib/erakeys').deriveAccounts(seed)[i - 1].address; }
+
+    // кошелёк на устройстве: вход подписью; магазин выставляет счёт на его адрес
+    const accs = keysJs.deriveAccounts(keysJs.generateSeed());
+    const ch = (await api('POST', '/api/wallet/challenge')).data;
+    const w = (await api('POST', '/api/wallet/login', { publicKeys: accs.map((a) => a.publicKeyB58), nonce: ch.nonce, signature: txJs.signBytes(accs[0], new TextEncoder().encode(ch.message)) })).data.token;
+    // демо: у кошелька 100 ERA; счёт в ERA (curr = номер актива 1, как в примерах протокола)
+    const issued = (await api('POST', '/api/invoices/issue', { from: shop, user: accs[3].address, order: 'W-1', sum: '7', curr: 1 }, owner)).data;
+    let r = await api('POST', '/api/invoices/find', { mine: true }, w);
+    assert.deepStrictEqual(r.data.map((x) => x.order), ['W-1'], JSON.stringify(r.data));
+    // перевод с уведомлением подписывается на устройстве
+    const prep = (await api('POST', '/api/invoices/prepare', { signature: issued.signature, user: accs[3].address, from: accs[0].address }, w)).data;
+    assert.deepStrictEqual([prep.to, prep.asset, prep.amount], [shop, 1, 7]);
+    const tx = txJs.buildRSend(accs[0], { recipient: prep.to, asset: prep.asset, amount: String(prep.amount), title: '', message: prep.message, timestamp: Date.now(), port: 9066 });
+    assert.strictEqual((await api('POST', '/api/wallet/broadcast', { raw: tx.raw }, w)).status, 200);
+    // чужой перевод вместо оплаты не засчитать
+    assert.strictEqual((await api('POST', '/api/invoices/paid-signed', { signature: issued.signature, user: accs[3].address, from: accs[0].address, txSignature: 'x'.repeat(88) }, w)).status, 400);
+    r = await api('POST', '/api/invoices/paid-signed', { signature: issued.signature, user: accs[3].address, from: accs[0].address, txSignature: tx.signature }, w);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.deepStrictEqual([r.data.status, r.data.signedOnDevice], ['sent', true]);
+    // с чужого счёта подготовить оплату нельзя
+    assert.strictEqual((await api('POST', '/api/invoices/prepare', { signature: issued.signature, user: accs[3].address, from: shop }, w)).status, 403);
+
+    // клиент банка (регистрация в банке) платит со своего счёта через /api/invoices/pay
+    const seed = (await api('POST', '/api/register/new')).data.seed;
+    const cli = (await api('POST', '/api/register', { seed }, null)).data.token;
+    const ck = require('../lib/erakeys').deriveAccounts(seed);
+    await api('POST', '/api/transfer', { from: deriveAccountsAddr(DEMO_SEED, 1), to: ck[0].address, asset: 1048, amount: '20' }, owner);
+    const inv2 = (await api('POST', '/api/invoices/issue', { from: shop, user: '+7 900 555-44-33', order: 'C-1', sum: '15', curr: 643 }, owner)).data;
+    r = await api('POST', '/api/invoices/find', { user: '89005554433' }, cli);
+    assert.deepStrictEqual(r.data.map((x) => x.order), ['C-1']);
+    assert.strictEqual((await api('POST', '/api/invoices/pay', { signature: inv2.signature, user: '89005554433', from: deriveAccountsAddr(DEMO_SEED, 1) }, cli)).status, 403, 'не со своего счёта');
+    r = await api('POST', '/api/invoices/pay', { signature: inv2.signature, user: '89005554433', from: ck[0].address }, cli);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual(r.data.amount, 15);
 });

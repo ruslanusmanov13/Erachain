@@ -23,8 +23,8 @@ const ITEMS = [
 ];
 
 // кошелёк на устройстве: подписываются на телефоне переводы и письма; остальное — просмотр
-const WALLET = new Set(['#/keys', '#/history', '#/transfer/batch', '#/messages', '#/catalog', '#/network', '#/settings']);
-const CABINET = new Set(['#/history', '#/transfer/batch', '#/polls', '#/exchange/1/2', '#/documents', '#/messages', '#/persons', '#/assets/issue', '#/catalog', '#/network', '#/settings']);
+const WALLET = new Set(['#/keys', '#/history', '#/transfer/batch', '#/invoices', '#/messages', '#/catalog', '#/network', '#/settings']);
+const CABINET = new Set(['#/invoices', '#/history', '#/transfer/batch', '#/polls', '#/exchange/1/2', '#/documents', '#/messages', '#/persons', '#/assets/issue', '#/catalog', '#/network', '#/settings']);
 
 function icon(d) {
     const ns = 'http://www.w3.org/2000/svg';

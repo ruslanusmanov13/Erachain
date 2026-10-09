@@ -319,7 +319,6 @@ class DemoBackend {
     }
 
     async history(address, limit = 50) {
-        if (!this.external.has(address)) this.own(address);
         return this.txs
             .filter((t) => t.from === address || t.to === address)
             .slice(0, limit)
@@ -652,6 +651,12 @@ class DemoBackend {
         return this.telegrams
             .filter((m) => m.from === address || m.to === address)
             .map((m) => ({ ...m, direction: m.to === address ? 'in' : 'out' }));
+    }
+
+    async deleteTelegrams(list) {
+        const set = new Set(list);
+        this.telegrams = this.telegrams.filter((m) => !set.has(m.signature));
+        return [];
     }
 
     async findTelegrams(address, filter) {

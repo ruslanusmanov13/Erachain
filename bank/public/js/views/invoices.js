@@ -1,43 +1,72 @@
 import { get, post, put } from '../api.js';
 import { el, card, field, input, select, form, tabs, fmt, short, date, kv, empty, spinner, toast, badge, confirm, openDialog, closeDialog } from '../ui.js';
-import { accountSelect, can, loadAccounts } from '../state.js';
+import { state, accountSelect, can, loadAccounts } from '../state.js';
+import { isWalletRole, sendSigned } from '../wallet/session.js';
+import { withDeviceKeys } from '../seed.js';
 
 const CURRS = [{ value: 643, label: 'RUB (643)' }, { value: 840, label: 'USD (840)' }, { value: 978, label: 'EUR (978)' }, { value: 1, label: 'ERA (актив 1)' }, { value: 2, label: 'COMPU (актив 2)' }];
 const ISSUED = {
     issued: ['ждёт оплаты', 'warn'], pending: ['ждёт подтверждения в сети', 'warn'], partial: ['оплачен частично', 'warn'], paid: ['оплачен', 'ok'],
     untrusted: ['оплата от недоверенного банка', 'bad'], wrong_asset: ['оплата не той валютой', 'bad'], late: ['оплачен после срока', 'bad'],
+    cancelled: ['отменён', ''],
 };
 
-let lastUser = '';
+let lastQuery = { user: '' };
+
+// состояние счёта у покупателя: открыт, частично, оплачен здесь или в другом банке, отменён, истёк
+const STATE = {
+    open: ['к оплате', 'warn'], partial: ['оплачен частично', 'warn'], paid: ['оплачен', 'ok'], paid_elsewhere: ['оплачен в другом банке', 'ok'],
+    cancelled: ['отменён магазином', 'bad'], expired: ['истёк', ''],
+};
+const stateBadge = (inv) => (inv.pendingHere ? badge('подтверждается', 'warn')
+    : inv.state === 'partial' ? badge(`частично · осталось ${fmt(inv.remaining, 2)}`, 'warn')
+        : badge(...(STATE[inv.state] || [inv.state, ''])));
+
+// оплата: с подписью на телефоне (кошелёк на устройстве) или через кошелёк банка
+async function payInvoice(inv, d) {
+    if (isWalletRole(state.me)) {
+        const prep = await post('invoices/prepare', { signature: inv.signature, user: inv.user, from: d.from, amount: d.amount });
+        const sent = await withDeviceKeys(() => sendSigned({ from: d.from, to: prep.to, asset: prep.asset, amount: String(prep.amount), title: '', message: prep.message }));
+        return post('invoices/paid-signed', { signature: inv.signature, user: inv.user, from: d.from, amount: String(prep.amount), txSignature: sent.signature });
+    }
+    return post('invoices/pay', { signature: inv.signature, user: inv.user, from: d.from, amount: d.amount });
+}
 
 function payDialog(inv, reload) {
-    const needAmount = inv.sum === null;
+    const topUp = inv.sum === null;
     const body = [
         el('h3', {}, inv.title || 'Счёт ' + inv.order),
+        stateBadge(inv),
         kv([
-            ['Заказ', inv.order], ['Сумма', needAmount ? 'любая (пополнение)' : `${fmt(inv.sum, 2)} ${inv.currName}`],
+            ['Заказ', inv.order], ['Сумма', topUp ? 'любая (пополнение)' : `${fmt(inv.sum, 2)} ${inv.currName}`],
+            ['Оплачено здесь', inv.paidHere ? `${fmt(inv.paidHere, 2)} ${inv.currName}` : null],
+            ['Оплачено в других банках', inv.paidElsewhere ? `${fmt(inv.paidElsewhere, 2)} ${inv.currName}` : null],
+            ['Осталось оплатить', !topUp && inv.paidTotal ? `${fmt(inv.remaining, 2)} ${inv.currName}` : null],
             ['Магазин', el('span', { class: 'mono small' }, inv.shop)], ['Покупатель', inv.user],
             ['Назначение', inv.description], ['Реквизиты', inv.details], ['Выставлен', date(inv.date)], ['Действует до', date(inv.expiresAt)],
         ]),
     ];
-    if (inv.paid && ['paid', 'sent'].includes(inv.paid.status)) {
-        body.push(inv.paid.status === 'paid' ? badge('оплачен ' + date(inv.paid.paidAt), 'ok') : badge('перевод отправлен, ждёт подтверждения', 'warn'),
-            el('p', { class: 'tiny mono' }, inv.paid.txId));
-    } else if (inv.expired) {
-        body.push(el('p', { class: 'note' }, 'Срок счёта истёк — попросите магазин выставить новый.'));
-    } else if (can('sign')) {
+    if (inv.paid && inv.paid.txId) body.push(el('p', { class: 'tiny mono' }, 'Наша оплата: ' + inv.paid.txId));
+    const canPay = !inv.cancelled && !inv.expired && !inv.pendingHere && (topUp || inv.remaining > 0) && (can('sign') || isWalletRole(state.me));
+    if (inv.cancelled) body.push(el('p', { class: 'note' }, 'Магазин отменил этот счёт.'));
+    else if (inv.expired && !['paid', 'paid_elsewhere'].includes(inv.state)) body.push(el('p', { class: 'note' }, 'Срок счёта истёк — попросите магазин выставить новый.'));
+    if (canPay) {
+        const rest = topUp ? null : inv.remaining;
         body.push(form([
             field('Оплатить со счёта', accountSelect('from')),
-            needAmount ? field(`Сумма, ${inv.currName}`, input('amount', { inputmode: 'decimal', required: true })) : null,
-            el('p', { class: 'tiny muted' }, 'Магазин получит перевод с уведомлением об оплате в блокчейне и будет оповещён по адресу обратного вызова.'),
-        ], `Оплатить${needAmount ? '' : ' ' + fmt(inv.sum, 2) + ' ' + inv.currName}`, async (d) => {
-            const r = await post('invoices/pay', { signature: inv.signature, user: inv.user, from: d.from, amount: d.amount });
+            topUp ? field(`Сумма, ${inv.currName}`, input('amount', { inputmode: 'decimal', required: true }))
+                : field(`Сумма, ${inv.currName}`, input('amount', { inputmode: 'decimal', value: String(rest) }), 'Можно оплатить частично — меньше остатка'),
+            el('p', { class: 'tiny muted' }, isWalletRole(state.me)
+                ? 'Перевод с уведомлением подписывается на этом устройстве. Магазин узнает об оплате из блокчейна и по адресу обратного вызова.'
+                : 'Магазин получит перевод с уведомлением об оплате в блокчейне и будет оповещён по адресу обратного вызова.'),
+        ], topUp ? 'Оплатить' : `Оплатить`, async (d) => {
+            const r = await payInvoice(inv, d);
             await loadAccounts();
             openDialog(el('h3', {}, r.status === 'paid' ? 'Счёт оплачен' : 'Перевод отправлен'), kv([
                 ['Сумма', `${fmt(r.amount, 2)} ${inv.currName}`], ['Транзакция', el('span', { class: 'mono tiny' }, r.txId)],
                 ['Магазин', r.callbackUrl ? 'будет оповещён, когда перевод подтвердится в сети' : 'узнает об оплате из блокчейна'],
             ]), el('button', { class: 'btn primary', type: 'button', onclick: () => { closeDialog(); reload(); } }, 'Готово'));
-        }, { confirm: (d) => `Оплатить счёт ${inv.order} магазину ${short(inv.shop)} на ${needAmount ? d.amount : fmt(inv.sum, 2)} ${inv.currName}?` }));
+        }, { confirm: (d) => `Оплатить счёт ${inv.order} магазину ${short(inv.shop)} на ${d.amount || rest} ${inv.currName}?` }));
     }
     body.push(el('button', { class: 'btn', type: 'button', onclick: closeDialog }, 'Закрыть'));
     openDialog(...body);
@@ -45,32 +74,33 @@ function payDialog(inv, reload) {
 
 async function payView() {
     const results = el('div', {});
-    const search = async (user) => {
-        lastUser = user;
+    const search = async (q) => {
+        lastQuery = q;
         results.replaceChildren(spinner());
         try {
-            const list = await post('invoices/find', { user });
+            const list = await post('invoices/find', q);
             results.replaceChildren(list.length ? card(el('div', { class: 'list' }, list.map((inv) => {
-                const state = inv.paid && inv.paid.status === 'paid' ? badge('оплачен', 'ok') : inv.paid && inv.paid.status === 'sent' ? badge('подтверждается', 'warn')
-                    : inv.expired ? badge('истёк') : badge('к оплате', 'warn');
                 const item = el('div', { class: 'list-item clickable' },
                     el('div', { class: 'icon-circle' }, '₽'),
                     el('div', { class: 'grow' }, el('div', { class: 'title' }, inv.title || inv.order),
                         el('div', { class: 'sub' }, `${inv.order} · ${date(inv.date)} · магазин ${short(inv.shop)}`)),
-                    el('div', { class: 'right' }, el('b', { class: 'num' }, inv.sum === null ? 'любая' : fmt(inv.sum, 2) + ' ' + inv.currName), el('br'), state));
-                item.addEventListener('click', () => payDialog(inv, () => search(user)));
+                    el('div', { class: 'right' }, el('b', { class: 'num' }, inv.sum === null ? 'любая' : fmt(inv.sum, 2) + ' ' + inv.currName), el('br'), stateBadge(inv)));
+                item.addEventListener('click', () => payDialog(inv, () => search(q)));
                 return item;
-            }))) : card(empty('Счетов для этого клиента нет')));
+            }))) : card(empty('Счетов не найдено')));
         } catch (e) {
             results.replaceChildren(card(el('p', { class: 'error' }, e.message)));
         }
     };
+    const role = state.me && state.me.user.role;
+    const own = ['client', 'wallet', 'account'].includes(role);
+    const mine = own ? el('button', { class: 'btn soft block', type: 'button', onclick: () => search({ mine: true, user: '' }) }, 'Мои счета — выставленные на адреса моих счетов') : null;
     const f = form([
-        el('p', { class: 'small muted' }, 'Магазины выставляют счета на ID покупателя — телефон, e-mail или адрес Erachain. Найдите счета клиента и оплатите их.'),
-        field('ID клиента', input('user', { required: true, value: lastUser, placeholder: '79001234567', inputmode: 'tel' })),
-    ], 'Найти счета', async (d) => search(d.user.trim()));
-    if (lastUser) search(lastUser);
-    return el('div', { class: 'stack' }, card(f), results);
+        el('p', { class: 'small muted' }, 'Магазины выставляют счета на ID покупателя — телефон, e-mail или адрес Erachain. Телефон можно писать как угодно: +7, 8 или без кода.'),
+        field('ID клиента', input('user', { required: true, value: lastQuery.user || '', placeholder: '79001234567 ivan@mail.ru', inputmode: 'text' }), 'Можно несколько через пробел'),
+    ], 'Найти счета', async (d) => search({ user: d.user.trim() }));
+    if (lastQuery.user || lastQuery.mine) search(lastQuery);
+    return el('div', { class: 'stack' }, mine ? card(mine) : null, card(f), results);
 }
 
 async function issueView() {
@@ -122,7 +152,22 @@ async function issuedView() {
                 const conf = (n.confirmations ?? 1) > 0 ? '' : ' · ждёт подтверждения';
                 return el('div', { class: 'tiny ' + (n.trusted && n.assetOk !== false && !n.late ? 'in' : 'out') },
                     `${problem ? '⚠' : '✓'} ${fmt(n.amount ?? n.sum, 2)} от ${short(n.from)}${conf}${problem ? ' — ' + problem : ''}`);
-            })));
+            }),
+            // отмена счёта магазином: банк покупателя увидит её и не даст оплатить
+            ['issued', 'untrusted', 'wrong_asset', 'late'].includes(inv.status) && can('sign') ? el('div', {}, el('button', {
+                class: 'btn small danger', type: 'button', onclick: async (e) => {
+                    if (!(await confirm(`Отменить счёт ${inv.order}? Банк покупателя увидит отмену и не даст его оплатить.`))) return;
+                    e.target.disabled = true;
+                    try {
+                        await post(`invoices/${inv.signature}/cancel`);
+                        toast('Счёт отменён');
+                        box.replaceWith(await issuedView());
+                    } catch (err) {
+                        toast(err.message);
+                        e.target.disabled = false;
+                    }
+                },
+            }, 'Отменить счёт')) : null));
     }))) : card(empty('Вы ещё не выставляли счета')));
     return box;
 }
@@ -145,14 +190,26 @@ async function settingsView() {
         }
         await put('invoices/settings', { channel: d.channel.trim(), currencies, trustedBanks: d.trusted.split(/[\s,;]+/).filter(Boolean), minConfirmations: Number(d.minConfirmations) });
         toast('Сохранено');
-    }));
+    }), el('hr'), el('h3', {}, 'Уборка канала'),
+    el('p', { class: 'small muted' }, 'Удалить с ноды банка телеграммы оплаченных, отменённых и давно (более 7 дней) истёкших счетов. На блокчейн и оплаты это не влияет.'),
+    el('button', { class: 'btn soft block', type: 'button', onclick: async (e) => {
+        e.target.disabled = true;
+        try {
+            const r = await post('invoices/cleanup', {});
+            toast(r.deleted ? `Удалено телеграмм: ${r.deleted}` : 'Убирать нечего');
+        } catch (err) {
+            toast(err.message);
+        }
+        e.target.disabled = false;
+    } }, 'Убрать старые счета'));
 }
 
 export default {
     title: 'Счета на оплату',
     async render(params) {
         const views = { pay: payView, issue: issueView, issued: issuedView, settings: settingsView };
-        const mode = views[params[0]] ? params[0] : 'pay';
+        const payerRole = state.me && ['client', 'wallet', 'account'].includes(state.me.user.role);
+        const mode = views[params[0]] && !payerRole ? params[0] : 'pay';
         const body = el('div', {}, spinner());
         const show = async (k) => {
             body.replaceChildren(spinner());
@@ -163,8 +220,10 @@ export default {
             }
         };
         show(mode);
-        const items = [['pay', 'Оплатить'], ['issue', 'Выставить'], ['issued', 'Выставленные']];
-        if (can('settings')) items.push(['settings', 'Настройки']);
+        // клиенту и кошельку — только оплата; магазину (банку) — выставление и настройки
+        const payer = state.me && ['client', 'wallet', 'account'].includes(state.me.user.role);
+        const items = payer ? [['pay', 'Оплатить']] : [['pay', 'Оплатить'], ['issue', 'Выставить'], ['issued', 'Выставленные']];
+        if (!payer && can('settings')) items.push(['settings', 'Настройки']);
         return el('div', {}, tabs(items, mode, show), body);
     },
 };

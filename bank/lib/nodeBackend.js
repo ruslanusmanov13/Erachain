@@ -426,15 +426,25 @@ class NodeBackend {
     }
 
     // телеграммы на счёт с фильтром по заголовку (так банк находит счета клиента по его ID)
-    async findTelegrams(address, filter) {
-        const list = await this.call('telegrams/address/' + address, { query: { filter, outcomes: false } });
+    // password — расшифровать зашифрованные счета ключом счёта-канала (нода подставляет текст в message)
+    async findTelegrams(address, filter, password = null) {
+        const list = await this.call('telegrams/address/' + address, {
+            query: { filter: filter || undefined, outcomes: false, decrypt: password ? true : undefined, password: password || undefined },
+        });
         return (Array.isArray(list) ? list : []).map((item) => {
             const tx = item.transaction || item;
+            const decrypted = tx.encrypted && password && tx.message && tx.message !== 'decode error';
             return {
-                signature: tx.signature, timestamp: tx.timestamp ?? null, from: tx.creator, to: tx.recipient,
-                title: tx.title || '', message: tx.isText === false || tx.encrypted ? '' : (tx.message || ''), encrypted: !!tx.encrypted,
+                signature: tx.signature, timestamp: tx.timestamp ?? null, from: tx.creator, to: tx.recipient, title: tx.title || '',
+                message: decrypted ? tx.message : tx.isText === false || tx.encrypted ? '' : (tx.message || ''), encrypted: !!tx.encrypted,
             };
         });
+    }
+
+    // удалить телеграммы с этой ноды (уборка канала счетов); возвращает подписи, которые удалить не удалось
+    async deleteTelegrams(list, password) {
+        const r = await this.call('telegrams/delete', { query: { password }, body: { list } });
+        return Array.isArray(r) ? r : [];
     }
 
     async sendMessage(m, password) {

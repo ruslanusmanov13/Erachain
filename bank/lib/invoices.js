@@ -72,7 +72,7 @@ function parseInvoice(tg) {
     } catch (e) {
         return null;
     }
-    if (!m || typeof m !== 'object' || m.orderSignature) return null; // уведомление об оплате, не счёт
+    if (!m || typeof m !== 'object' || m.orderSignature || m.operation) return null; // уведомление или отмена, не счёт
     const date = Number(m.date) || tg.timestamp || Date.now();
     const expire = Number(m.expire) > 0 ? Number(m.expire) : 60;
     return {
@@ -84,6 +84,49 @@ function parseInvoice(tg) {
         date, expiresAt: date + expire * 60000, timestamp: tg.timestamp,
     };
 }
+
+// отмена счёта магазином (протокол «Безопасный платёж»): {"operation": "delete,<подпись счёта>"}
+function parseCancel(tg) {
+    try {
+        const m = JSON.parse(tg.message);
+        const op = m && typeof m.operation === 'string' ? m.operation.split(',') : [];
+        return op[0] === 'delete' && op[1] ? { invoice: op[1].trim(), shop: tg.from, signature: tg.signature, timestamp: tg.timestamp } : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// все написания ID клиента: телефон с 7, 8, +7 и без кода; e-mail без учёта регистра; адреса как есть
+function idVariants(input) {
+    const out = new Set();
+    // телефоны с пробелами, скобками и дефисами склеиваем до разбиения на слова
+    const src = String(input || '').replace(/(?<![A-Za-z0-9])(?:\+7|8|7)?[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)/g, (m) => ' ' + m.replace(/[^\d+]/g, '') + ' ');
+    for (const raw of src.split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean)) {
+        const digits = raw.replace(/[^\d]/g, '');
+        if (/^\+?[\d\s()-]{10,18}$/.test(raw) && (digits.length === 10 || (digits.length === 11 && /^[78]/.test(digits)))) {
+            const d = digits.slice(-10);
+            ['7' + d, '8' + d, '+7' + d, d].forEach((x) => out.add(x));
+        } else if (raw.includes('@')) {
+            out.add(raw.toLowerCase());
+        } else {
+            out.add(raw);
+        }
+    }
+    return [...out].slice(0, 30);
+}
+
+// единый вид ID: телефон — 7XXXXXXXXXX, e-mail — строчными, адрес — как есть
+function canonicalIds(input) {
+    const out = [];
+    for (const v of idVariants(input)) {
+        const d = /^\+?\d{10,11}$/.test(v) ? v.replace(/\D/g, '').slice(-10) : null;
+        const c = d ? '7' + d : v;
+        if (!out.includes(c)) out.push(c);
+    }
+    return out;
+}
+
+const userTokens = (user) => canonicalIds(user);
 
 class Invoices {
     constructor(backend, store) {
@@ -137,7 +180,7 @@ class Invoices {
     }
 
     currName(curr) {
-        return ISO_NAMES[curr] || '#' + curr;
+        return ISO_NAMES[curr] || { 1: 'ERA', 2: 'COMPU' }[Number(curr)] || '#' + curr;
     }
 
     // ---------- магазин: выставить счёт ----------
@@ -147,7 +190,8 @@ class Invoices {
         const channel = text(body.channel, 40) || this.store.data.invoiceSettings.channel;
         if (!isAddress(from)) throw new BankError('Выберите счёт магазина');
         if (!isAddress(channel)) throw new BankError('Укажите счёт банка, куда отправить счёт (канал)');
-        const user = text(body.user, 120);
+        // ID покупателя — в едином виде (несколько через пробел), чтобы банк нашёл счёт при любом написании
+        const user = canonicalIds(text(body.user, 300)).join(' ').slice(0, 120);
         if (!user) throw new BankError('Укажите ID покупателя: телефон, e-mail или адрес Erachain');
         const curr = Number(body.curr || 643);
         if (!Number.isSafeInteger(curr) || curr <= 0) throw new BankError('Неверная валюта');
@@ -238,7 +282,8 @@ class Invoices {
         inv.paidSum = Number(confirmed.reduce((s, x) => s + (x.amount ?? x.sum ?? 0), 0).toFixed(8));
         inv.pendingSum = Number(valid.filter((x) => !confirmed.includes(x)).reduce((s, x) => s + (x.amount || 0), 0).toFixed(8));
         const full = inv.sum === null || inv.sum === undefined ? inv.paidSum > 0 : inv.paidSum >= inv.sum;
-        if (full) inv.status = 'paid';
+        if (inv.cancelledAt && !inv.paidSum && !inv.pendingSum) inv.status = 'cancelled';
+        else if (full) inv.status = 'paid';
         else if (inv.pendingSum > 0) inv.status = 'pending';
         else if (inv.paidSum > 0) inv.status = 'partial';
         else if (inv.notices.some((x) => x.trusted && x.assetOk === false)) inv.status = 'wrong_asset';
@@ -249,53 +294,125 @@ class Invoices {
 
     // ---------- банк: найти и оплатить счета клиента ----------
 
-    async find(body) {
+    /**
+     * Счета клиента по всем его ID (несколько через пробел, разные написания телефона, свои адреса).
+     * Зашифрованные счета нода расшифровывает паролем банка (если открыта смена). По каждому счёту —
+     * сколько оплачено здесь и в других доверенных банках (§3.1 протокола), остаток, отмена магазином.
+     */
+    async find(body, password = null, ownAddresses = []) {
         const channel = text(body.channel, 40) || this.store.data.invoiceSettings.channel;
         if (!isAddress(channel)) throw new BankError('Укажите счёт-канал банка в настройках счетов');
-        const user = text(body.user, 120);
-        if (!user) throw new BankError('Укажите ID клиента: телефон, e-mail или адрес');
-        const list = (await this.backend.findTelegrams(channel, user)).map(parseInvoice).filter(Boolean);
-        const paid = new Map([...this.store.data.invoicesPaid].reverse().map((p) => [p.invoice, p])); // последняя попытка — главная
-        return list.map((inv) => ({
-            ...inv,
-            currName: this.currName(inv.curr),
-            expired: Date.now() > inv.expiresAt,
-            paid: paid.get(inv.signature) || null,
-        })).sort((a, b) => b.date - a.date);
+        const ids = idVariants([text(body.user, 400), body.mine ? ownAddresses.join(' ') : ''].join(' '));
+        if (!ids.length) throw new BankError('Укажите ID клиента: телефон, e-mail или адрес (можно несколько через пробел)');
+        const want = new Set(canonicalIds(ids.join(' ')));
+        const telegrams = new Map();
+        for (const id of ids) {
+            for (const tg of await this.backend.findTelegrams(channel, id, password)) telegrams.set(tg.signature, tg);
+        }
+        const cancels = [...telegrams.values()].map(parseCancel).filter(Boolean);
+        const list = [...telegrams.values()].map(parseInvoice).filter(Boolean)
+            .filter((inv) => userTokens(inv.user).some((u) => want.has(u)));
+        const result = [];
+        for (const inv of list) {
+            const cancelled = cancels.find((c) => c.invoice === inv.signature && c.shop === inv.shop);
+            result.push({ ...inv, currName: this.currName(inv.curr), expired: Date.now() > inv.expiresAt, cancelled: cancelled ? cancelled.timestamp || true : null });
+        }
+        await this.attachPayments(result);
+        return result.sort((a, b) => b.date - a.date);
     }
 
-    async pay(body, password, user) {
+    // оплачено по счёту: нашим банком (записи оплат) и другими доверенными банками (уведомления в истории магазина)
+    async attachPayments(list) {
+        const trusted = new Set(this.store.data.invoiceSettings.trustedBanks);
+        const ours = this.store.data.invoicesPaid;
+        const histories = new Map();
+        for (const inv of list) {
+            const mine = ours.filter((p) => p.invoice === inv.signature && ['sent', 'paid', 'paying'].includes(p.status));
+            inv.paid = [...ours].reverse().find((p) => p.invoice === inv.signature) || null; // последняя попытка
+            inv.paidHere = Number(mine.reduce((sum, p) => sum + p.amount, 0).toFixed(8));
+            inv.pendingHere = mine.some((p) => p.status !== 'paid');
+            inv.paidElsewhere = 0;
+            inv.elsewhere = [];
+            if (trusted.size) {
+                if (!histories.has(inv.shop)) {
+                    histories.set(inv.shop, await this.backend.history(inv.shop, 300).catch(() => []));
+                }
+                let asset = null;
+                try {
+                    asset = this.assetFor(inv.curr);
+                } catch (e) { /* без актива — не считаем */ }
+                const ourTx = new Set(mine.map((p) => p.txId));
+                for (const tx of histories.get(inv.shop)) {
+                    if (tx.direction !== 'in' || !tx.message || ourTx.has(tx.signature) || !trusted.has(tx.from)) continue;
+                    let n;
+                    try {
+                        n = JSON.parse(tx.message);
+                    } catch (e) {
+                        continue;
+                    }
+                    if (!n || n.orderSignature !== inv.signature || Number(tx.asset) !== asset) continue;
+                    inv.paidElsewhere += Number(tx.amount) || 0;
+                    inv.elsewhere.push({ bank: tx.from, amount: Number(tx.amount) || 0, signature: tx.signature, timestamp: tx.timestamp });
+                }
+                inv.paidElsewhere = Number(inv.paidElsewhere.toFixed(8));
+            }
+            const total = inv.paidHere + inv.paidElsewhere;
+            inv.paidTotal = Number(total.toFixed(8));
+            inv.remaining = inv.sum === null ? null : Math.max(0, Number((inv.sum - total).toFixed(8)));
+            inv.state = inv.cancelled ? 'cancelled'
+                : inv.sum !== null && inv.remaining <= 0 ? (inv.paidHere > 0 ? 'paid' : 'paid_elsewhere')
+                    : total > 0 && inv.sum !== null ? 'partial'
+                        : inv.expired ? 'expired' : 'open';
+        }
+        return list;
+    }
+
+    // проверить счёт и рассчитать сумму к оплате: остаток с учётом оплат здесь и в других банках
+    async prepare(body, password = null) {
         const signature = text(body.signature, 120);
         const from = text(body.from, 40);
         if (!isAddress(from)) throw new BankError('Выберите счёт для оплаты');
-        if (this.store.data.invoicesPaid.some((p) => p.invoice === signature && p.status !== 'failed')) throw new BankError('Счёт уже оплачен (или оплата ждёт подтверждения в сети)');
-        const channel = text(body.channel, 40) || this.store.data.invoiceSettings.channel;
-        const found = (await this.backend.findTelegrams(channel, text(body.user, 120))).map(parseInvoice).filter(Boolean);
+        const found = await this.find({ channel: body.channel, user: body.user }, password);
         const inv = found.find((i) => i.signature === signature);
         if (!inv) throw new BankError('Счёт не найден', 404);
+        if (inv.cancelled) throw new BankError('Магазин отменил этот счёт');
         if (Date.now() > inv.expiresAt) throw new BankError('Срок счёта истёк — попросите магазин выставить новый');
+        if (inv.pendingHere) throw new BankError('Оплата по этому счёту уже отправлена и ждёт подтверждения в сети');
         let amount;
+        const a = amountOf(body.amount);
         if (inv.sum !== null) {
-            amount = inv.sum;
+            if (inv.remaining <= 0) throw new BankError(inv.state === 'paid_elsewhere' ? 'Счёт уже оплачен в другом банке' : 'Счёт уже оплачен');
+            // по умолчанию — весь остаток; можно меньше (частичная оплата по протоколу)
+            amount = body.amount !== undefined && body.amount !== '' && body.amount !== null ? Number(a) : inv.remaining;
+            if (!(amount > 0) || !isAmount(String(amount))) throw new BankError('Неверная сумма');
+            if (amount > inv.remaining + 1e-9) throw new BankError(`Больше остатка по счёту: осталось ${inv.remaining}`);
         } else {
-            const a = amountOf(body.amount);
             if (!isAmount(a)) throw new BankError('Счёт без суммы — укажите, сколько оплатить');
             amount = Number(a);
         }
         const asset = this.assetFor(inv.curr);
+        const notice = { orderSignature: signature, curr: inv.curr, sum: amount };
+        return { inv, from, amount, asset, notice, transfer: { from, to: inv.shop, asset, amount: String(amount), title: '', message: JSON.stringify(notice) } };
+    }
+
+    record(prep, user, extra) {
+        const { inv } = prep;
         const record = {
-            id: crypto.randomUUID(), invoice: signature, order: inv.order, shop: inv.shop, from, amount, curr: inv.curr, asset,
-            status: 'paying', createdAt: Date.now(), by: user ? user.login : null,
-            callbackUrl: inv.callback || null, callback: inv.callback ? { state: 'waiting', attempts: 0 } : null,
+            id: crypto.randomUUID(), invoice: inv.signature, order: inv.order, shop: inv.shop, from: prep.from, amount: prep.amount,
+            curr: inv.curr, asset: prep.asset, status: 'paying', createdAt: Date.now(), by: user ? user.login : null,
+            callbackUrl: inv.callback || null, callback: inv.callback ? { state: 'waiting', attempts: 0 } : null, ...extra,
         };
         this.store.data.invoicesPaid.unshift(record);
         this.store.save();
+        return record;
+    }
+
+    async pay(body, password, user) {
+        const prep = await this.prepare(body, password);
+        const record = this.record(prep, user);
         try {
             // перевод магазину с уведомлением об оплате в сообщении — одна транзакция в блокчейне
-            const notice = { orderSignature: signature, curr: inv.curr, sum: amount };
-            const tx = await this.backend.transfer({
-                from, to: inv.shop, asset, amount: String(amount), title: '', message: JSON.stringify(notice), encrypt: false,
-            }, password);
+            const tx = await this.backend.transfer({ ...prep.transfer, encrypt: false }, password);
             // «отправлен»: магазин оповещается, когда перевод наберёт нужное число подтверждений (tick)
             Object.assign(record, { status: 'sent', txId: tx.signature, paidAt: Date.now() });
         } catch (e) {
@@ -306,6 +423,61 @@ class Invoices {
         this.store.save();
         await this.tick().catch(() => {}); // при 0 подтверждений в настройках — оповестить сразу
         return record;
+    }
+
+    // кошелёк на устройстве подписал перевод сам: сверяем транзакцию с подготовленной оплатой и ведём её дальше
+    async paidSigned(body, user) {
+        const prep = await this.prepare(body);
+        const txId = text(body.txSignature, 120);
+        const d = await this.backend.txData(txId).catch(() => null);
+        let notice = null;
+        try {
+            notice = d && JSON.parse(d.message || '');
+        } catch (e) { /* не JSON */ }
+        if (!d || d.from !== prep.from || d.to !== prep.inv.shop || !notice || notice.orderSignature !== prep.inv.signature) {
+            throw new BankError('Транзакция не похожа на оплату этого счёта');
+        }
+        const record = this.record(prep, user, { status: 'sent', txId, paidAt: Date.now(), signedOnDevice: true });
+        await this.tick().catch(() => {});
+        return record;
+    }
+
+    // магазин отменяет свой счёт: телеграмма {"operation":"delete,<подпись>"} в тот же канал
+    async cancel(signature, password) {
+        const inv = this.store.data.invoicesIssued.find((i) => i.signature === signature);
+        if (!inv) throw new BankError('Счёт не найден среди выставленных', 404);
+        if (inv.status === 'paid') throw new BankError('Счёт уже оплачен — отменить нельзя');
+        if (inv.status === 'cancelled') return inv;
+        await this.backend.sendMessage({
+            from: inv.shop, to: inv.channel, title: inv.user, message: JSON.stringify({ operation: 'delete,' + signature }), encrypt: false,
+        }, password);
+        Object.assign(inv, { status: 'cancelled', cancelledAt: Date.now() });
+        this.store.save();
+        return inv;
+    }
+
+    // уборка канала: удалить с ноды телеграммы оплаченных, отменённых и давно истёкших счетов
+    async cleanup(password, { keepDays = 7 } = {}) {
+        const channel = this.store.data.invoiceSettings.channel;
+        if (!isAddress(channel)) throw new BankError('Счёт-канал не задан');
+        const all = await this.backend.findTelegrams(channel, '', password);
+        const cancels = all.map(parseCancel).filter(Boolean);
+        const paid = new Set(this.store.data.invoicesPaid.filter((p) => p.status === 'paid').map((p) => p.invoice));
+        const old = Date.now() - keepDays * 86400000;
+        const list = [];
+        for (const tg of all) {
+            const inv = parseInvoice(tg);
+            if (inv && (paid.has(inv.signature) || inv.expiresAt < old || cancels.some((c) => c.invoice === inv.signature && c.shop === inv.shop))) list.push(tg.signature);
+            const c = parseCancel(tg);
+            if (c && (tg.timestamp || 0) < old) list.push(tg.signature);
+        }
+        if (!list.length) return { deleted: 0, left: 0 };
+        const left = await this.backend.deleteTelegrams(list, password);
+        return { deleted: list.length - left.length, left: left.length };
+    }
+
+    paidList() {
+        return this.store.data.invoicesPaid;
     }
 
     /**
@@ -354,9 +526,6 @@ class Invoices {
         return { changed };
     }
 
-    paidList() {
-        return this.store.data.invoicesPaid;
-    }
 }
 
-module.exports = { Invoices, parseInvoice, isPrivateIp, safeCallback };
+module.exports = { Invoices, parseInvoice, parseCancel, idVariants, canonicalIds, isPrivateIp, safeCallback };

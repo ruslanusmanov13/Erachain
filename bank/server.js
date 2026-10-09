@@ -172,7 +172,8 @@ function createApp(backend, options = {}) {
             return ['gateway']; // черновик договора, проверка погашений, отмена
         }
         if (pathname.startsWith('/api/invoices/')) {
-            if (method === 'GET' || pathname === '/api/invoices/find' || pathname === '/api/invoices/check') return ['read'];
+            if (method === 'GET' || ['/api/invoices/find', '/api/invoices/check', '/api/invoices/prepare', '/api/invoices/paid-signed'].includes(pathname)) return ['read'];
+            if (pathname === '/api/invoices/cleanup') return ['settings'];
             return pathname === '/api/invoices/settings' ? ['settings'] : ['sign'];
         }
         if (pathname.startsWith('/api/sbp/')) {
@@ -263,7 +264,7 @@ function createApp(backend, options = {}) {
         ['/api/assets', 'creator'], ['/api/polls', 'creator'], [/^\/api\/polls\/\d+\/vote$/, 'voter'],
         ['/api/exchange/orders', 'creator'], ['/api/exchange/cancel', 'creator'],
         ['/api/documents', 'creator'], ['/api/documents/vouch', 'creator'],
-        ['/api/persons', 'creator'], ['/api/persons/certify', 'creator'],
+        ['/api/persons', 'creator'], ['/api/persons/certify', 'creator'], ['/api/invoices/pay', 'from'],
     ];
     const CABINET_GET = /^\/api\/(me|network|accounts|assets(\/\d+|\/types)?|polls(\/\d+)?|persons(\/\d+)?|catalog\/(statuses|templates)|exchange\/\d+\/\d+|documents\/verify\/\w+)$/;
     const CABINET_GET_OWN = /^\/api\/(?:accounts\/([^/]+)\/history|exchange\/orders\/([^/]+)|messages\/([^/]+))$/;
@@ -285,6 +286,8 @@ function createApp(backend, options = {}) {
         if (p === '/api/logout' || ((isClient || isWallet) && p === '/api/session/account')) return;
         if (isWallet && p === '/api/wallet/broadcast') return; // отправитель проверяется в обработчике по подписи
         if (!isWallet && /^\/api\/tx\/[1-9A-HJ-NP-Za-km-z]+\/decrypt$/.test(p)) return; // свой ли счёт — проверит обработчик
+        // счета на оплату: поиск — всем; оплата со своего счёта (кошелёк — подготовка и отчёт о подписанном переводе)
+        if (p === '/api/invoices/find' || (isWallet && (p === '/api/invoices/prepare' || p === '/api/invoices/paid-signed'))) return;
         if (isWallet) throw new BankError('В кошельке на устройстве операции подписываются на телефоне — обновите приложение', 403);
         const rule = CABINET_SIGNER.find(([r]) => (typeof r === 'string' ? r === p : r.test(p)));
         if (!rule || req.method !== 'POST') throw denied();
@@ -753,8 +756,30 @@ function createApp(backend, options = {}) {
         ['POST', '/api/invoices/issue', async ({ req, session }) => invoices.issue(await readJson(req), session.password)],
         ['GET', '/api/invoices/issued', () => invoices.issued()],
         ['POST', '/api/invoices/check', ({ session }) => invoices.checkIssued(session.password)],
-        ['POST', '/api/invoices/find', async ({ req }) => invoices.find(await readJson(req))],
+        // поиск: «мои счета» — по своим адресам; зашифрованные счета расшифровывает нода паролем банка (смена)
+        ['POST', '/api/invoices/find', async ({ req, session }) => {
+            const body = await readJson(req);
+            let pw = null;
+            try {
+                pw = session.user.role === 'wallet' ? null : session.password;
+            } catch (e) { /* смена закрыта — зашифрованные счета не расшифруются */ }
+            return invoices.find(body, pw, session.scope || []);
+        }],
         ['POST', '/api/invoices/pay', async ({ req, session }) => invoices.pay(await readJson(req), session.password, session.user)],
+        // кошелёк на устройстве: подготовить перевод с уведомлением → подписать на телефоне → сообщить подпись
+        ['POST', '/api/invoices/prepare', async ({ req, session }) => {
+            const body = await readJson(req);
+            if (session.scope && !session.scope.includes(body.from)) throw new BankError('Это не ваш счёт', 403);
+            const p = await invoices.prepare(body);
+            return { ...p.transfer, amount: p.amount, invoice: p.inv.signature };
+        }],
+        ['POST', '/api/invoices/paid-signed', async ({ req, session }) => {
+            const body = await readJson(req);
+            if (session.scope && !session.scope.includes(body.from)) throw new BankError('Это не ваш счёт', 403);
+            return invoices.paidSigned(body, session.user);
+        }],
+        ['POST', /^\/api\/invoices\/([1-9A-HJ-NP-Za-km-z]{60,100})\/cancel$/, ({ m, session }) => invoices.cancel(m[1], session.password)],
+        ['POST', '/api/invoices/cleanup', async ({ req, session }) => invoices.cleanup(session.password, await readJson(req))],
         ['GET', '/api/invoices/paid', () => invoices.paidList()],
 
         // СБП: публичная страница оплаты (без входа)
