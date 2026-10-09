@@ -1,6 +1,6 @@
 // Точка входа: маршрутизация по #/раздел, вход в кошелёк, настройка адреса сервера.
 import { get, post, session, setUnauthorizedHandler, needsServer, isNative, serverUrl, setServerUrl } from './api.js';
-import { $, el, card, field, input, form, toast, spinner } from './ui.js';
+import { $, el, card, field, input, form, toast, spinner, confirm } from './ui.js';
 import { state, loadAccounts } from './state.js';
 import home from './views/home.js';
 import transfer from './views/transfer.js';
@@ -81,6 +81,8 @@ function showServerSetup() {
     ], 'Подключиться', async (data) => {
         let url = data.url.trim();
         if (!/^https?:\/\//.test(url)) url = 'https://' + url;
+        if (url.startsWith('http://') && !/^http:\/\/(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|localhost)/.test(url)
+            && !(await confirm('Адрес без HTTPS: пароль кошелька будет передаваться в открытом виде. Продолжить?'))) return;
         setServerUrl(url);
         try {
             await get('status');

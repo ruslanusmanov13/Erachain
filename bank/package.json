@@ -5,10 +5,23 @@
   "main": "server.js",
   "license": "MIT",
   "private": true,
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "demo": "node server.js --demo",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "cap:sync": "cap sync android",
+    "android:build": "cap sync android && cd android && ./gradlew assembleDebug"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.5.2"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.5.2",
+    "@capacitor/core": "8.5.2",
+    "@capacitor/filesystem": "8.1.3",
+    "@capacitor/share": "8.0.2"
   }
 }

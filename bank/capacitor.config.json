@@ -1,0 +1,13 @@
+{
+  "appId": "org.erachain.bank",
+  "appName": "Банк Erachain",
+  "webDir": "public",
+  "android": {
+    "allowMixedContent": false
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
