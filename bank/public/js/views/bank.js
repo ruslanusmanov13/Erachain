@@ -254,6 +254,9 @@ export default {
             }
         };
         show(mode);
-        return el('div', {}, tabs([['statements', 'Выписки'], ['deposits', 'Поступления'], ['withdrawals', 'Вывод'], ['settings', 'Шлюз']], mode, show), body);
+        const sbpLink = el('a', { class: 'menu-tile sbp-link', href: '#/sbp' },
+            el('b', {}, 'Приём платежей по СБП →'), el('span', { class: 'muted' }, 'QR-код для оплаты рублями из любого банка с начислением актива в Erachain'));
+        return el('div', { class: 'stack' }, sbpLink,
+            el('div', {}, tabs([['statements', 'Выписки'], ['deposits', 'Поступления'], ['withdrawals', 'Вывод'], ['settings', 'Шлюз']], mode, show), body));
     },
 };

@@ -18,10 +18,11 @@ import more from './views/more.js';
 import settings from './views/settings.js';
 import swap from './views/swap.js';
 import staffView from './views/staff.js';
+import sbp from './views/sbp.js';
 
-const views = { home, transfer, history, assets, polls, exchange, swap, staff: staffView, messages, documents, persons, catalog, bank, network, more, settings };
+const views = { home, transfer, history, assets, polls, exchange, swap, staff: staffView, sbp, messages, documents, persons, catalog, bank, network, more, settings };
 // разделы, доступные из «Сервисов», подсвечивают эту вкладку
-const navOf = { history: 'home', swap: 'more', staff: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
+const navOf = { history: 'home', sbp: 'bank', swap: 'more', staff: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
 
 let renderId = 0;
 

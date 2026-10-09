@@ -460,3 +460,108 @@ test('сотрудники: роли, смена, отзыв доступа, ж�
     assert.ok(audit.some((a) => a.action === 'POST /api/login' && !a.ok && a.login === 'kassir'));
     assert.ok(!JSON.stringify(audit).includes('kassir123'));
 });
+
+test('СБП: QR → оплата → начисление по курсу; смена, дубли, отказ, восстановление', async () => {
+    const { SbpService, SbpEmulator } = require('../lib/sbp');
+    const backend = new DemoBackend();
+    const store = new JsonStore(null, { sbpSettings: { payoutAccount: backend.mainAccount } });
+    let shiftOpen = false;
+    const sbp = new SbpService(new SbpEmulator({ acceptAfterMs: 0 }), backend, store, () => {
+        if (!shiftOpen) throw new v.BankError('Смена закрыта: попросите администратора открыть смену', 423);
+        return 'demo12345';
+    });
+    const client = Object.keys(Object.fromEntries(backend.accountsMap))[1];
+
+    await assert.rejects(sbp.createOrder({ receiver: client, amount: '10', asset: 1 }), /Минимальная/);
+    await assert.rejects(sbp.createOrder({ receiver: 'bad', amount: '100', asset: 1 }), /Неверный счёт/);
+    await assert.rejects(sbp.createOrder({ receiver: client, amount: '100', asset: 777 }), /не продаётся/);
+
+    const o = await sbp.createOrder({ receiver: client, amount: '551,00', asset: 1 });
+    assert.deepStrictEqual([o.status, o.amountRub, o.amountChain], ['SBP_ACTIVE', 551, 20]); // 551 ₽ / 27.55 = 20 ERA
+    assert.ok(o.payload.startsWith('https://qr.nspk.ru/'));
+    assert.strictEqual((await sbp.createOrder({ receiver: client, amount: '551', asset: 1 })).id, o.id); // тот же заказ
+
+    await sbp.tick(); // оплачен, но смена закрыта — ждёт в очереди
+    assert.strictEqual(sbp.get(o.id).status, 'ERA_QUEUE');
+    assert.match(sbp.get(o.id).message, /Смена закрыта/);
+
+    shiftOpen = true;
+    const before = backend.accountsMap.get(client).get(1);
+    await sbp.tick();
+    const sent = sbp.get(o.id);
+    assert.strictEqual(sent.status, 'ERA_SEND');
+    assert.strictEqual(backend.accountsMap.get(client).get(1) - before, 2000000000n); // +20 ERA
+    const tx = backend.txs.find((t) => t.signature === sent.txId);
+    assert.ok(tx.message.startsWith(sent.qrcId + ':')); // метка заказа в сообщении
+
+    backend.height += 2;
+    await sbp.tick();
+    assert.strictEqual(sbp.get(o.id).status, 'ERA_DONE');
+    assert.strictEqual(sbp.stats().creditedRub, 551);
+
+    // отказ банка плательщика (сумма с 13 копейками в эмуляторе)
+    const r = await sbp.createOrder({ receiver: client, amount: '100.13', asset: 1048 });
+    await sbp.tick();
+    assert.strictEqual(sbp.get(r.id).status, 'FAIL_SBP');
+
+    // сбой во время начисления: после перезапуска выплата находится по метке и не повторяется
+    const c = await sbp.createOrder({ receiver: client, amount: '200', asset: 1048 });
+    await sbp.tick();
+    const credited = sbp.get(c.id);
+    assert.strictEqual(credited.status, 'ERA_SEND');
+    const balance = backend.accountsMap.get(client).get(1048);
+    Object.assign(credited, { status: 'ERA_SENDING', txId: null }); // как будто сервер упал до записи результата
+    const restarted = new SbpService(sbp.client, backend, store, () => 'demo12345');
+    await restarted.tick();
+    assert.strictEqual(restarted.get(c.id).status, 'ERA_SEND');
+    assert.ok(restarted.get(c.id).txId);
+    assert.strictEqual(backend.accountsMap.get(client).get(1048), balance); // второго начисления нет
+});
+
+test('СБП: клиент банка «Точка» — пути, тело запроса, разбор статусов', async (t) => {
+    const { TochkaSbpClient } = require('../lib/sbp');
+    const seen = [];
+    const srv = http.createServer(async (req, res) => {
+        let body = '';
+        for await (const c of req) body += c;
+        seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: body ? JSON.parse(body) : null });
+        const reply = (code, b) => { res.statusCode = code; res.end(JSON.stringify(b)); };
+        if (req.url === '/qr-code/merchant/MF01/40702810000000000001/044525104') return reply(200, { Data: { qrcId: 'AD100', payload: 'https://qr.nspk.ru/AD100', image: { mediaType: 'image/png', content: 'iVBOR' } } });
+        if (req.url === '/qr-codes/AD100,AD200/payment-status') return reply(200, { Data: { paymentList: [{ qrcId: 'AD200', status: 'Rejected', message: 'нет средств' }, { qrcId: 'AD100', status: 'Accepted', trxId: 'T1' }] } });
+        return reply(400, { code: '400', message: 'Что-то пошло не так', Errors: [{ message: 'qrcode not found' }] });
+    });
+    const base = await listen(srv);
+    t.after(() => srv.close());
+    const c = new TochkaSbpClient({ token: 'tok', merchantId: 'MF01', account: '40702810000000000001', bik: '044525104', baseUrl: base });
+    const qr = await c.createQr({ amountKop: 55095, purpose: 'Паевой взнос', sourceName: A, ttlMinutes: 10 });
+    assert.deepStrictEqual([qr.qrcId, qr.image.content], ['AD100', 'iVBOR']);
+    assert.strictEqual(seen[0].auth, 'Bearer tok');
+    assert.deepStrictEqual(seen[0].body.Data, {
+        amount: 55095, currency: 'RUB', qrcType: '02', paymentPurpose: 'Паевой взнос',
+        imageParams: { width: 300, height: 300, mediaType: 'image/png' }, sourceName: A, ttl: 10,
+    });
+    const list = await c.paymentStatuses(['AD100', 'AD200']);
+    assert.deepStrictEqual(list.map((p) => p.status), ['Rejected', 'Accepted']);
+    await assert.rejects(c.qrInfo('XX'), /qrcode not found/);
+});
+
+test('СБП: публичная страница и права сотрудников', async (t) => {
+    const { SbpEmulator } = require('../lib/sbp');
+    const backend = new DemoBackend();
+    const server = createServer(backend, {
+        store: new JsonStore(null, { sbpSettings: { payoutAccount: backend.mainAccount } }), sbpClient: new SbpEmulator(), sbpIntervalMs: 0,
+    });
+    const base = await listen(server);
+    t.after(() => server.close());
+    const cfg = await (await fetch(base + '/api/public/sbp/config')).json();
+    assert.strictEqual(cfg.enabled, true);
+    const created = await fetch(base + '/api/public/sbp/orders', { method: 'POST', body: JSON.stringify({ receiver: A, amount: '300', asset: 1048 }) });
+    const order = await created.json();
+    assert.strictEqual(order.status, 'SBP_ACTIVE');
+    assert.strictEqual(order.trxIdSbp, undefined); // служебные поля наружу не отдаются
+    const viewed = await (await fetch(base + '/api/public/sbp/orders/' + order.id)).json();
+    assert.strictEqual(viewed.id, order.id);
+    assert.strictEqual((await fetch(base + '/api/sbp/orders')).status, 401); // список — только сотрудникам
+    for (let i = 0; i < 9; i++) await fetch(base + '/api/public/sbp/orders', { method: 'POST', body: JSON.stringify({ receiver: A, amount: String(100 + i), asset: 1048 }) });
+    assert.strictEqual((await fetch(base + '/api/public/sbp/orders', { method: 'POST', body: JSON.stringify({ receiver: A, amount: '999', asset: 1048 }) })).status, 429);
+});

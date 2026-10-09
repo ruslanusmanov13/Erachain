@@ -11,6 +11,7 @@ const { JsonStore } = require('./lib/store');
 const { Gateway } = require('./lib/bank/gateway');
 const { SevenPayClient, SevenPayDemo, SwapService } = require('./lib/sevenpay');
 const { Staff, ROLES } = require('./lib/staff');
+const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -51,6 +52,25 @@ function createApp(backend, options = {}) {
         return swap;
     };
     const corsOrigins = new Set(options.corsOrigins || []);
+    // СБП: начисление идёт паролем открытой смены (у сервера нет пароля кошелька, пока смена закрыта)
+    const sbp = options.sbpClient ? new SbpService(options.sbpClient, backend, store, () => staff.walletPassword({ password: null })) : null;
+    const requireSbp = () => {
+        if (!sbp) throw new BankError('Приём платежей по СБП не подключён: задайте TOCHKA_SBP_TOKEN и реквизиты на сервере', 503);
+        return sbp;
+    };
+    if (sbp && options.sbpIntervalMs !== 0) {
+        const timer = setInterval(() => sbp.tick().catch((e) => console.error('sbp:', e.message)), options.sbpIntervalMs || 4000);
+        if (timer.unref) timer.unref();
+    }
+    // ограничение публичного создания QR: не больше 10 заказов за 10 минут с одного адреса
+    const publicHits = new Map();
+    function publicLimit(ip) {
+        const now = Date.now();
+        const list = (publicHits.get(ip) || []).filter((t) => now - t < 600000);
+        if (list.length >= 10) throw new BankError('Слишком много запросов, попробуйте через несколько минут', 429);
+        list.push(now);
+        publicHits.set(ip, list);
+    }
 
     // password — пароль кошелька (только у владельца), у сотрудника null: подпись идёт по открытой смене
     function openSession(password, user) {
@@ -89,6 +109,10 @@ function createApp(backend, options = {}) {
     // права на маршрут: GET — просмотр, остальное — по разделу; список прав — все обязательны
     function permsFor(method, pathname) {
         if (pathname === '/api/logout' || pathname === '/api/me') return [];
+        if (pathname.startsWith('/api/sbp/')) {
+            if (method === 'GET') return ['read'];
+            return pathname === '/api/sbp/settings' ? ['settings'] : ['gateway'];
+        }
         if (pathname.startsWith('/api/staff') || pathname.startsWith('/api/shift') || pathname === '/api/audit') return ['staff'];
         if (pathname === '/api/bank/statement') return ['statements'];
         if (pathname === '/api/bank/settings') return method === 'GET' ? ['gateway'] : ['settings'];
@@ -294,6 +318,27 @@ function createApp(backend, options = {}) {
         ['GET', '/api/swap/rates', () => requireSwap().rates()],
         ['GET', '/api/swap/track', ({ url }) => requireSwap().track(url.searchParams.get('curr'), url.searchParams.get('address'))],
 
+        // СБП: публичная страница оплаты (без входа)
+        ['GET', '/api/public/sbp/config', () => requireSbp().publicConfig(), { public: true }],
+        ['POST', '/api/public/sbp/orders', async ({ req, ip }) => {
+            publicLimit(ip);
+            return requireSbp().createOrder(await readJson(req), 'public');
+        }, { public: true }],
+        ['GET', /^\/api\/public\/sbp\/orders\/([\w-]{36})$/, ({ m }) => requireSbp().view(requireSbp().get(m[1])), { public: true }],
+        ['POST', /^\/api\/public\/sbp\/orders\/([\w-]{36})\/emulate$/, ({ m }) => requireSbp().emulatePay(m[1]), { public: true }],
+
+        // СБП: раздел сотрудников
+        ['GET', '/api/sbp/orders', () => ({ orders: requireSbp().list(), stats: requireSbp().stats() })],
+        ['GET', '/api/sbp/settings', () => requireSbp().settings()],
+        ['PUT', '/api/sbp/settings', async ({ req }) => requireSbp().updateSettings(await readJson(req))],
+        ['POST', '/api/sbp/orders', async ({ req, session }) => requireSbp().createOrder(await readJson(req), 'office', session.user.login)],
+        ['POST', /^\/api\/sbp\/orders\/([\w-]+)\/retry$/, ({ m }) => requireSbp().retry(m[1])],
+        ['POST', /^\/api\/sbp\/orders\/([\w-]+)\/emulate$/, ({ m }) => requireSbp().emulatePay(m[1])],
+        ['POST', '/api/sbp/check', async () => {
+            await requireSbp().tick();
+            return { ok: true };
+        }],
+
         // банковская интеграция
         ['GET', '/api/bank/statement', ({ url, session }) => statement(url, session)],
         ['GET', '/api/bank/settings', () => gateway.settings()],
@@ -453,10 +498,15 @@ if (require.main === module) {
         tls,
         // в демо адреса случайные при каждом запуске, поэтому данные шлюза хранятся только в памяти
         store: demo
-            ? new JsonStore(null, { settings: demoGatewaySettings(backend) })
+            ? new JsonStore(null, { settings: demoGatewaySettings(backend), sbpSettings: { payoutAccount: backend.mainAccount } })
             : new JsonStore(path.join(dataDir, 'gateway.json'), {}),
         webhookSecret: process.env.BANK_WEBHOOK_SECRET || '',
         demoStaff: demo ? DEMO_STAFF : null,
+        sbpClient: demo ? new SbpEmulator()
+            : process.env.TOCHKA_SBP_TOKEN ? new TochkaSbpClient({
+                token: process.env.TOCHKA_SBP_TOKEN, merchantId: process.env.TOCHKA_MERCHANT, account: process.env.TOCHKA_ACCOUNT,
+                bik: process.env.TOCHKA_BIK, mode: process.env.TOCHKA_MODE === 'prod' ? 'prod' : 'test',
+            }) : null,
         sevenpay: demo ? new SevenPayDemo()
             : process.env.SEVENPAY_URL === 'off' ? null : new SevenPayClient(process.env.SEVENPAY_URL || 'https://7pay.in'),
         corsOrigins: (process.env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
