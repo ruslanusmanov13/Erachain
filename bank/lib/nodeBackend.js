@@ -297,6 +297,18 @@ class NodeBackend {
         }).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
     }
 
+    // телеграммы на счёт с фильтром по заголовку (так банк находит счета клиента по его ID)
+    async findTelegrams(address, filter) {
+        const list = await this.call('telegrams/address/' + address, { query: { filter, outcomes: false } });
+        return (Array.isArray(list) ? list : []).map((item) => {
+            const tx = item.transaction || item;
+            return {
+                signature: tx.signature, timestamp: tx.timestamp ?? null, from: tx.creator, to: tx.recipient,
+                title: tx.title || '', message: tx.isText === false || tx.encrypted ? '' : (tx.message || ''), encrypted: !!tx.encrypted,
+            };
+        });
+    }
+
     async sendMessage(m, password) {
         const res = await this.call(`telegrams/send/${m.from}/${m.to}`, {
             query: { title: m.title, message: m.message, encrypt: m.encrypt || undefined, encoding: 0, feePow: 0, password },

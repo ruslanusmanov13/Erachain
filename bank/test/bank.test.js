@@ -565,3 +565,51 @@ test('СБП: публичная страница и права сотрудни
     for (let i = 0; i < 9; i++) await fetch(base + '/api/public/sbp/orders', { method: 'POST', body: JSON.stringify({ receiver: A, amount: String(100 + i), asset: 1048 }) });
     assert.strictEqual((await fetch(base + '/api/public/sbp/orders', { method: 'POST', body: JSON.stringify({ receiver: A, amount: '999', asset: 1048 }) })).status, 429);
 });
+
+test('счета на оплату: магазин выставляет, банк находит по телефону и оплачивает, магазин видит оплату', async () => {
+    const { Invoices, isPrivateIp, safeCallback } = require('../lib/invoices');
+    const backend = new DemoBackend();
+    const [payer, shop] = [...backend.accountsMap.keys()];
+    const store = new JsonStore(null, { invoiceSettings: { channel: backend.invoiceChannel, trustedBanks: [] } });
+    const inv = new Invoices(backend, store);
+
+    await assert.rejects(inv.issue({ from: shop, user: '', sum: '10' }, 'demo12345'), /ID покупателя/);
+    const issued = await inv.issue({ from: shop, user: '79161112233', order: 'A-1', sum: '250.5', curr: 643, title: 'Заказ A-1', callback: 'https://shop.example/cb?signature=' }, 'demo12345');
+    assert.strictEqual(issued.status, 'issued');
+
+    const found = await inv.find({ user: '79161112233' });
+    assert.strictEqual(found.length, 1);
+    assert.deepStrictEqual([found[0].order, found[0].sum, found[0].currName, found[0].shop], ['A-1', 250.5, 'RUB', shop]);
+    assert.strictEqual((await inv.find({ user: '70000000000' })).length, 0);
+
+    const shopBefore = backend.accountsMap.get(shop).get(1048) || 0n;
+    const paid = await inv.pay({ signature: found[0].signature, user: '79161112233', from: payer }, 'demo12345');
+    assert.strictEqual(paid.status, 'paid');
+    assert.strictEqual((backend.accountsMap.get(shop).get(1048) || 0n) - shopBefore, 25050000000n); // 250.5 «цифровых рублей»
+    const tx = backend.txs.find((t) => t.signature === paid.txId);
+    assert.deepStrictEqual(JSON.parse(tx.message), { orderSignature: found[0].signature, curr: 643, sum: 250.5 });
+    assert.ok(paid.callback && paid.callback.ok === false); // магазин недоступен из теста — оплата всё равно проведена
+    await assert.rejects(inv.pay({ signature: found[0].signature, user: '79161112233', from: payer }, 'demo12345'), /уже оплачен/);
+
+    // магазин не доверяет счёту банка — оплата помечается как непроверенная
+    let check = await inv.checkIssued('demo12345');
+    assert.strictEqual(check.invoices[0].status, 'untrusted');
+    // после добавления банка в доверенные следующая оплата засчитывается
+    inv.updateSettings({ trustedBanks: [payer] });
+    const second = await inv.issue({ from: shop, user: '79161112233', order: 'A-2', curr: 643 }, 'demo12345');
+    await assert.rejects(inv.pay({ signature: second.signature, user: '79161112233', from: payer }, 'demo12345'), /без суммы/);
+    await inv.pay({ signature: second.signature, user: '79161112233', from: payer, amount: '100' }, 'demo12345');
+    check = await inv.checkIssued('demo12345');
+    const s2 = check.invoices.find((i) => i.order === 'A-2');
+    assert.deepStrictEqual([s2.status, s2.paidSum], ['paid', 100]);
+
+    // просроченный счёт не оплачивается
+    const old = await inv.issue({ from: shop, user: '79161112233', order: 'OLD', sum: '1', expire: 1 }, 'demo12345');
+    backend.telegrams.find((m) => m.signature === old.signature).message = JSON.stringify({ ...JSON.parse(backend.telegrams.find((m) => m.signature === old.signature).message), date: Date.now() - 120000 });
+    await assert.rejects(inv.pay({ signature: old.signature, user: '79161112233', from: payer }, 'demo12345'), /Срок счёта истёк/);
+
+    // обратный вызов не уходит во внутреннюю сеть
+    assert.ok(isPrivateIp('127.0.0.1') && isPrivateIp('10.1.2.3') && isPrivateIp('192.168.0.5') && !isPrivateIp('93.184.216.34'));
+    assert.match((await safeCallback('http://shop.example/cb', 'S')).error, /https/);
+    assert.match((await safeCallback('https://localhost/cb', 'S')).error, /внутренней сети/);
+});

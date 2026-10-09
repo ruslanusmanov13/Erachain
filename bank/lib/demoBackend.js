@@ -70,6 +70,15 @@ class DemoBackend {
             from: client, to: this.gatewayAccount, asset: 1048, amount: '2500', title: 'Вывод на карту',
             message: 'ВЫВОД;Петров Пётр Петрович;500100732259;40817810099910004312;044525225',
         }).height -= 10;
+        // счета на оплату: канал банка и выставленные магазинами счета для клиента +7 900 123-45-67
+        this.invoiceChannel = randomAddress();
+        const shop = randomAddress();
+        const invoice = (order, sum, title, minutes) => ({
+            signature: base58(crypto.randomBytes(64)), timestamp: Date.now() - minutes * 60000, from: shop, to: this.invoiceChannel,
+            title: '79001234567', encrypted: false,
+            message: JSON.stringify({ date: Date.now() - minutes * 60000, order, user: '79001234567', curr: 643, ...(sum ? { sum } : {}), expire: 60 * 24, title, description: 'Без НДС' }),
+        });
+        this.telegrams.push(invoice('ZK-1043', 1490, 'Оплата заказа в магазине «Книжный»', 5), invoice('DEP-77', null, 'Пополнение счёта в магазине', 30));
         this.personsMap.set(1, { key: 1, name: 'Иванов Иван Иванович', description: 'Генеральный директор', maker: a, birthday: Date.parse('1980-05-12'), gender: 0, height: 180, accounts: [a] });
         this.pollsMap.set(1, {
             key: 1, name: 'Утверждение бюджета на 2027 год', description: 'Голосование держателей ERA', maker: a,
@@ -417,13 +426,17 @@ class DemoBackend {
             .map((m) => ({ ...m, direction: m.to === address ? 'in' : 'out' }));
     }
 
+    async findTelegrams(address, filter) {
+        return this.telegrams.filter((m) => m.to === address && (!filter || (m.title || '').includes(filter))).map((m) => ({ ...m }));
+    }
+
     async sendMessage(m, password) {
         this.check(password);
         this.own(m.from);
         const msg = { signature: base58(crypto.randomBytes(64)), timestamp: Date.now(), from: m.from, to: m.to, title: m.title, message: m.message, encrypted: m.encrypt };
         this.telegrams.unshift(msg);
         // демо: если получатель в кошельке — он видит сообщение; иначе имитируем автоответ
-        if (!this.accountsMap.has(m.to)) {
+        if (!this.accountsMap.has(m.to) && !String(m.message || '').startsWith('{')) {
             this.telegrams.unshift({ signature: base58(crypto.randomBytes(64)), timestamp: Date.now() + 1, from: m.to, to: m.from, title: 'Re: ' + (m.title || 'сообщение'), message: 'Получено, спасибо!', encrypted: false });
         }
         return { signature: msg.signature, status: 'ok' };

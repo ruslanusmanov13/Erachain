@@ -12,6 +12,7 @@ const { Gateway } = require('./lib/bank/gateway');
 const { SevenPayClient, SevenPayDemo, SwapService } = require('./lib/sevenpay');
 const { Staff, ROLES } = require('./lib/staff');
 const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
+const { Invoices } = require('./lib/invoices');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -40,6 +41,7 @@ function createApp(backend, options = {}) {
     const store = options.store || new JsonStore(null, {});
     const gateway = new Gateway(backend, store);
     const staff = new Staff(store);
+    const invoices = new Invoices(backend, store);
     // демо: готовые сотрудники и открытая смена, чтобы роли можно было опробовать сразу
     if (options.demoStaff) {
         for (const u of options.demoStaff.users) if (!store.data.staff.some((x) => x.login === u.login)) staff.create(u);
@@ -109,6 +111,10 @@ function createApp(backend, options = {}) {
     // права на маршрут: GET — просмотр, остальное — по разделу; список прав — все обязательны
     function permsFor(method, pathname) {
         if (pathname === '/api/logout' || pathname === '/api/me') return [];
+        if (pathname.startsWith('/api/invoices/')) {
+            if (method === 'GET' || pathname === '/api/invoices/find' || pathname === '/api/invoices/check') return ['read'];
+            return pathname === '/api/invoices/settings' ? ['settings'] : ['sign'];
+        }
         if (pathname.startsWith('/api/sbp/')) {
             if (method === 'GET') return ['read'];
             return pathname === '/api/sbp/settings' ? ['settings'] : ['gateway'];
@@ -318,6 +324,16 @@ function createApp(backend, options = {}) {
         ['GET', '/api/swap/rates', () => requireSwap().rates()],
         ['GET', '/api/swap/track', ({ url }) => requireSwap().track(url.searchParams.get('curr'), url.searchParams.get('address'))],
 
+        // счета на оплату («Безопасный платёж»)
+        ['GET', '/api/invoices/settings', () => invoices.settings()],
+        ['PUT', '/api/invoices/settings', async ({ req }) => invoices.updateSettings(await readJson(req))],
+        ['POST', '/api/invoices/issue', async ({ req, session }) => invoices.issue(await readJson(req), session.password)],
+        ['GET', '/api/invoices/issued', () => invoices.issued()],
+        ['POST', '/api/invoices/check', ({ session }) => invoices.checkIssued(session.password)],
+        ['POST', '/api/invoices/find', async ({ req }) => invoices.find(await readJson(req))],
+        ['POST', '/api/invoices/pay', async ({ req, session }) => invoices.pay(await readJson(req), session.password, session.user)],
+        ['GET', '/api/invoices/paid', () => invoices.paidList()],
+
         // СБП: публичная страница оплаты (без входа)
         ['GET', '/api/public/sbp/config', () => requireSbp().publicConfig(), { public: true }],
         ['POST', '/api/public/sbp/orders', async ({ req, ip }) => {
@@ -498,7 +514,10 @@ if (require.main === module) {
         tls,
         // в демо адреса случайные при каждом запуске, поэтому данные шлюза хранятся только в памяти
         store: demo
-            ? new JsonStore(null, { settings: demoGatewaySettings(backend), sbpSettings: { payoutAccount: backend.mainAccount } })
+            ? new JsonStore(null, {
+                settings: demoGatewaySettings(backend), sbpSettings: { payoutAccount: backend.mainAccount },
+                invoiceSettings: { channel: backend.invoiceChannel, trustedBanks: [backend.mainAccount] },
+            })
             : new JsonStore(path.join(dataDir, 'gateway.json'), {}),
         webhookSecret: process.env.BANK_WEBHOOK_SECRET || '',
         demoStaff: demo ? DEMO_STAFF : null,
