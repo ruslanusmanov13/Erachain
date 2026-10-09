@@ -86,7 +86,7 @@ public class TradeResource {
                 "get list of ALL orders (in CAP and completed) by address from OrderID. "
                         + "Use Order ID as Block-seqNo or Long. For example 103506-3 or 928735142671");
 
-        help.put("GET trade/cancel/[creator]/[signature]?password=[password]",
+        help.put("GET trade/cancel/[creator]/[signature|seqNo]?password=[password]",
                 "Cancel Order");
 
         help.put("GET trade/updatepairs/[days]",
@@ -245,10 +245,20 @@ public class TradeResource {
         APIUtils.askAPICallAllowed(password, "GET create Order\n ", request, true);
 
         byte[] signature;
-        try {
-            signature = Base58.decode(signatureStr);
-        } catch (Exception e) {
-            throw ApiErrorFactory.getInstance().createError(Transaction.INVALID_SIGNATURE);
+        Long orderSeqNo = Transaction.parseDBRef(signatureStr);
+        if (orderSeqNo != null) {
+            // order may be given by its SeqNo (as in orders lists): find signature of the CreateOrder transaction
+            Transaction orderTx = DCSet.getInstance().getTransactionFinalMap().get(orderSeqNo);
+            if (orderTx == null) {
+                throw ApiErrorFactory.getInstance().createError(Transaction.ORDER_DOES_NOT_EXIST);
+            }
+            signature = orderTx.getSignature();
+        } else {
+            try {
+                signature = Base58.decode(signatureStr);
+            } catch (Exception e) {
+                throw ApiErrorFactory.getInstance().createError(Transaction.INVALID_SIGNATURE);
+            }
         }
 
         // READ CREATOR

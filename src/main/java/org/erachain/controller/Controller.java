@@ -3499,25 +3499,26 @@ public class Controller extends Observable {
         String errorName = null;
         try {
             errorName = "birthday";
-            birthday = (long) (Long) jsonObject.getOrDefault("birthday", 0L);
+            // JSON numbers may come as Long or Double - read them as Number
+            birthday = ((Number) jsonObject.getOrDefault("birthday", 0L)).longValue();
             errorName = "deathday";
-            Long deathdayLong = (Long) jsonObject.get("deathday");
-            if (deathdayLong == null) {
+            Number deathdayNum = (Number) jsonObject.get("deathday");
+            if (deathdayNum == null) {
                 deathday = birthday - 1;
             } else {
-                birthday = deathdayLong;
+                deathday = deathdayNum.longValue();
             }
 
             errorName = "gender - man:0, wimen:1, none:2";
-            gender = (byte) (int) (long) (Long) jsonObject.get("gender");
+            gender = ((Number) jsonObject.get("gender")).byteValue();
 
             errorName = "birthLatitude: float";
-            birthLatitude = (float) (double) (Double) jsonObject.getOrDefault("birthLatitude", 0.0f);
+            birthLatitude = ((Number) jsonObject.getOrDefault("birthLatitude", 0.0f)).floatValue();
             errorName = "birthLongitude: float";
-            birthLongitude = (float) (double) (Double) jsonObject.getOrDefault("birthLongitude", 0.0f);
+            birthLongitude = ((Number) jsonObject.getOrDefault("birthLongitude", 0.0f)).floatValue();
 
             errorName = "height: 10..250";
-            height = (int) (long) (Long) jsonObject.get("height");
+            height = ((Number) jsonObject.get("height")).intValue();
 
             race = (String) jsonObject.get("race");
             skinColor = (String) jsonObject.get("skinColor");
