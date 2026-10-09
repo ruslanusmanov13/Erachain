@@ -69,12 +69,25 @@ function verify() {
     return card(el('p', { class: 'small muted' }, 'Проверьте, что файл не изменён и был удостоверен в блокчейне: хеш файла сравнивается с записанными в сети.'), pick, result);
 }
 
+function vouch() {
+    return card(form([
+        el('p', { class: 'small muted' }, 'Заверение — подпись второй стороны под уже записанной транзакцией: договором, документом, переводом. Укажите номер транзакции (например 1234567-1) — его видно в карточке операции.'),
+        field('Заверить со счёта', accountSelect('creator')),
+        field('Номер транзакции', input('seqNo', { required: true, placeholder: '1234567-1' })),
+    ], 'Заверить', async (d, f) => {
+        const r = await post('documents/vouch', { creator: d.creator, seqNo: d.seqNo.trim() });
+        f.reset();
+        txResult('Транзакция заверена', r);
+    }, { confirm: (d) => `Заверить транзакцию ${d.seqNo} своей подписью?` }));
+}
+
 export default {
     title: 'Документы',
     async render(params) {
-        const mode = params[0] === 'verify' ? 'verify' : 'sign';
-        const body = el('div', {}, mode === 'verify' ? verify() : sign());
-        return el('div', {}, tabs([['sign', 'Подписать'], ['verify', 'Проверить']], mode, (k) => body.replaceChildren(k === 'verify' ? verify() : sign())), body);
+        const views = { sign, verify, vouch };
+        const mode = views[params[0]] ? params[0] : 'sign';
+        const body = el('div', {}, views[mode]());
+        return el('div', {}, tabs([['sign', 'Подписать'], ['verify', 'Проверить'], ['vouch', 'Заверить']], mode, (k) => body.replaceChildren(views[k]())), body);
     },
 };
 

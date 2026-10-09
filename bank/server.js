@@ -13,6 +13,7 @@ const { SevenPayClient, SevenPayDemo, SwapService } = require('./lib/sevenpay');
 const { Staff, ROLES } = require('./lib/staff');
 const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
 const { Invoices } = require('./lib/invoices');
+const { Loans } = require('./lib/loans');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -42,6 +43,7 @@ function createApp(backend, options = {}) {
     const gateway = new Gateway(backend, store);
     const staff = new Staff(store);
     const invoices = new Invoices(backend, store);
+    const loans = new Loans(backend, store);
     // демо: готовые сотрудники и открытая смена, чтобы роли можно было опробовать сразу
     if (options.demoStaff) {
         for (const u of options.demoStaff.users) if (!store.data.staff.some((x) => x.login === u.login)) staff.create(u);
@@ -111,6 +113,11 @@ function createApp(backend, options = {}) {
     // права на маршрут: GET — просмотр, остальное — по разделу; список прав — все обязательны
     function permsFor(method, pathname) {
         if (pathname === '/api/logout' || pathname === '/api/me') return [];
+        if (pathname.startsWith('/api/loans')) {
+            if (method === 'GET' || pathname === '/api/loans/preview') return ['read'];
+            if (/\/(sign|vouch|issue|repay|confiscate)$/.test(pathname)) return ['sign'];
+            return ['gateway']; // черновик договора, проверка погашений, отмена
+        }
         if (pathname.startsWith('/api/invoices/')) {
             if (method === 'GET' || pathname === '/api/invoices/find' || pathname === '/api/invoices/check') return ['read'];
             return pathname === '/api/invoices/settings' ? ['settings'] : ['sign'];
@@ -306,6 +313,12 @@ function createApp(backend, options = {}) {
         // документы
         ['POST', '/api/documents', async ({ req, session }) => backend.signDocument(v.validateDocument(await readJson(req)), session.password)],
         ['GET', /^\/api\/documents\/verify\/([1-9A-HJ-NP-Za-km-z]{40,46})$/, ({ m }) => backend.verifyDocument(m[1])],
+        ['POST', '/api/documents/vouch', async ({ req, session }) => {
+            const body = await readJson(req);
+            if (!v.isAddress(body.creator)) throw new BankError('Выберите счёт, которым заверить');
+            if (!/^\d+-\d+$/.test(String(body.seqNo || '').trim())) throw new BankError('Номер транзакции: например 123456-1');
+            return backend.vouch(body.creator, String(body.seqNo).trim(), session.password);
+        }],
 
         // персоны и справочники
         ['GET', '/api/persons', ({ url }) => backend.persons(Number(url.searchParams.get('from')) || 0)],
@@ -323,6 +336,19 @@ function createApp(backend, options = {}) {
         ['GET', /^\/api\/swap\/orders\/([\w-]+)\/history$/, ({ m }) => requireSwap().history(m[1])],
         ['GET', '/api/swap/rates', () => requireSwap().rates()],
         ['GET', '/api/swap/track', ({ url }) => requireSwap().track(url.searchParams.get('curr'), url.searchParams.get('address'))],
+
+        // кредиты
+        ['GET', '/api/loans', () => loans.list()],
+        ['POST', '/api/loans/preview', async ({ req }) => Loans.preview(await readJson(req))],
+        ['POST', '/api/loans', async ({ req }) => loans.create(await readJson(req))],
+        ['GET', /^\/api\/loans\/([\w-]+)$/, ({ m }) => loans.view(loans.get(m[1]))],
+        ['POST', /^\/api\/loans\/([\w-]+)\/sign$/, ({ m, session }) => loans.sign(m[1], session.password)],
+        ['POST', /^\/api\/loans\/([\w-]+)\/vouch$/, ({ m, session }) => loans.vouch(m[1], session.password)],
+        ['POST', /^\/api\/loans\/([\w-]+)\/issue$/, ({ m, session }) => loans.issue(m[1], session.password)],
+        ['POST', /^\/api\/loans\/([\w-]+)\/repay$/, async ({ req, m, session }) => loans.repay(m[1], await readJson(req), session.password)],
+        ['POST', /^\/api\/loans\/([\w-]+)\/scan$/, ({ m, session }) => loans.scan(m[1], session.password)],
+        ['POST', /^\/api\/loans\/([\w-]+)\/confiscate$/, async ({ req, m, session }) => loans.confiscate(m[1], await readJson(req), session.password)],
+        ['POST', /^\/api\/loans\/([\w-]+)\/cancel$/, ({ m }) => loans.cancel(m[1])],
 
         // счета на оплату («Безопасный платёж»)
         ['GET', '/api/invoices/settings', () => invoices.settings()],

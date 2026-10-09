@@ -613,3 +613,62 @@ test('счета на оплату: магазин выставляет, бан�
     assert.match((await safeCallback('http://shop.example/cb', 'S')).error, /https/);
     assert.match((await safeCallback('https://localhost/cb', 'S')).error, /внутренней сети/);
 });
+
+test('кредиты: график, выдача в долг, погашение, просрочка с неустойкой, взыскание, заверение', async () => {
+    const { Loans, buildSchedule } = require('../lib/loans');
+    const sched = buildSchedule({ principal: 120000, ratePct: 12, termMonths: 12, type: 'annuity', startDate: Date.parse('2026-01-15'), scale: 2 });
+    assert.strictEqual(sched[0].total, 10661.85);
+    assert.strictEqual(sched.reduce((s, r) => s + r.interest, 0).toFixed(2), '7942.26');
+    assert.deepStrictEqual(Loans.preview({ principal: '120000', ratePct: '12', termMonths: 12, type: 'diff' }).schedule.map((r) => r.total).slice(0, 2), [11200, 11100]);
+
+    const backend = new DemoBackend();
+    const [bank, client] = [...backend.accountsMap.keys()];
+    const loans = new Loans(backend, new JsonStore(null, {}));
+    const P = 'demo12345';
+    await assert.rejects(loans.create({ lender: bank, borrower: bank, asset: 1, principal: '10', ratePct: 10, termMonths: 3 }), /заёмщика/);
+    const l = await loans.create({ lender: bank, borrower: client, borrowerName: 'Петров П.П.', asset: 1, assetName: 'ERA', principal: '300', ratePct: '24', termMonths: 3, scale: 2 });
+    assert.strictEqual(l.status, 'draft');
+    assert.match(l.number, /^КД-\d{4}-0001$/);
+
+    const signed = await loans.sign(l.id, P);
+    assert.strictEqual(signed.status, 'signed');
+    const doc = backend.txs.find((t) => t.signature === signed.contractTx);
+    assert.match(doc.message, /Заёмщик: Петров П\.П\./);
+    await assert.rejects(loans.vouch(l.id, P), /ещё не подтверждена/); // заверить можно после блока
+    backend.height += 2;
+    assert.ok((await loans.vouch(l.id, P)).vouchTx);
+
+    const clientBefore = backend.accountsMap.get(client).get(1);
+    const issued = await loans.issue(l.id, P);
+    assert.strictEqual(issued.status, 'active');
+    assert.strictEqual(backend.accountsMap.get(client).get(1) - clientBefore, 30000000000n); // +300 ERA
+    assert.strictEqual(backend.debtOf(bank, 1), 30000000000n); // у банка 300 ERA выдано в долг
+
+    // платёж по графику: сначала проценты (300 * 2% = 6), потом тело
+    const firstTotal = issued.schedule[0].total; // 104.03: аннуитет 300 под 24% на 3 месяца
+    assert.strictEqual(firstTotal, 104.03);
+    let after = await loans.repay(l.id, { amount: String(firstTotal) }, P);
+    // срок не наступил — всё в тело досрочно; погашенный целиком период больше не несёт процентов
+    assert.deepStrictEqual([after.payments[0].toInterest, after.payments[0].toPrincipal], [0, 104.03]);
+    assert.deepStrictEqual([after.schedule[0].interest, after.state.restPrincipal], [0, 195.97]);
+
+    // просрочка: «переносим» время вперёд на 40 дней после второго платежа
+    const loan = loans.get(l.id);
+    const now = loan.schedule[1].date + 40 * 86400000;
+    const st = loans.state(loan, now);
+    assert.ok(st.overdue > 0 && st.penalty > 0, JSON.stringify(st));
+
+    // взыскание всей оставшейся задолженности
+    after = await loans.confiscate(l.id, { amount: String(loans.state(loan).restPrincipal) }, P);
+    assert.strictEqual(after.status, 'closed');
+    assert.strictEqual(backend.debtOf(bank, 1), 0n);
+    assert.strictEqual(backend.txs.find((t) => t.signature === after.payments[0].tx).typeName, 'Взыскание долга');
+
+    // погашение, которое заёмщик сделал сам: находится по номеру договора
+    const l2 = await loans.create({ lender: bank, borrower: client, asset: 1, principal: '100', ratePct: '0', termMonths: 2 });
+    await loans.issue(l2.id, P);
+    await backend.debtTransfer({ from: client, to: bank, asset: 1, amount: '50', title: `Погашение по договору ${l2.number}` }, P);
+    const found = await loans.scan(l2.id, P);
+    assert.deepStrictEqual([found.added, found.loan.state.restPrincipal], [1, 50]);
+    assert.strictEqual((await loans.scan(l2.id, P)).added, 0); // повторно не засчитывается
+});

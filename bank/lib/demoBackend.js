@@ -200,9 +200,20 @@ class DemoBackend {
         return [...this.accountsMap.entries()].map(([address, map]) => ({
             address,
             balances: [...map.entries()].sort((x, y) => x[0] - y[0]).map(([asset, units]) => ({
-                asset, name: this.assetName(asset), amount: fromUnits(units), debt: '0', hold: '0', spend: '0',
+                asset, name: this.assetName(asset), amount: fromUnits(units), debt: fromUnits(this.debtOf(address, asset)), hold: '0', spend: '0',
             })),
         }));
+    }
+
+    debtOf(address, asset) {
+        let sum = 0n;
+        for (const [key, units] of this.debts || []) {
+            const [lender, borrower, a] = key.split('|');
+            if (Number(a) !== asset) continue;
+            if (lender === address) sum += units;
+            if (borrower === address) sum -= units;
+        }
+        return sum;
     }
 
     async openAccount(password) {
@@ -230,6 +241,48 @@ class DemoBackend {
         this.move(t.from, t.to, t.asset, t.amount);
         const tx = this.record('transfer', { typeName: 'Перевод', from: t.from, to: t.to, asset: t.asset, amount: t.amount, title: t.title, message: t.message });
         return (await this.history(t.from, 50)).find((x) => x.signature === tx.signature);
+    }
+
+    // долг в демо: выдача уменьшает собственность кредитора и увеличивает у заёмщика, учёт долга отдельно
+    async debtTransfer(t, password) {
+        this.check(password);
+        const asset = Math.abs(t.asset);
+        const units = toUnits(t.amount);
+        this.debts = this.debts || new Map();
+        let lender;
+        let borrower;
+        if (t.backward) {
+            lender = t.from; borrower = t.to; // взыскание: кредитор забирает у заёмщика
+        } else if (this.accountsMap.has(t.from) && (this.debts.get(`${t.to}|${t.from}|${asset}`) || 0n) > 0n) {
+            lender = t.to; borrower = t.from; // возврат долга заёмщиком
+        } else {
+            lender = t.from; borrower = t.to; // выдача в долг
+        }
+        const key = `${lender}|${borrower}|${asset}`;
+        const owed = this.debts.get(key) || 0n;
+        const src = this.accountsMap.get(t.backward ? borrower : t.from);
+        const dst = this.accountsMap.get(t.backward ? lender : t.to);
+        const reduces = t.backward || lender !== t.from;
+        // сначала все проверки, потом изменения
+        if (reduces && units > owed) throw new BankError('Сумма больше долга');
+        if (src && (src.get(asset) || 0n) < units + (asset === 2 && src === this.accountsMap.get(t.from) ? toUnits(FEE) : 0n)) throw new BankError('Недостаточно средств');
+        this.payFee(t.from);
+        this.debts.set(key, reduces ? owed - units : owed + units);
+        if (src) src.set(asset, src.get(asset) - units);
+        if (dst) dst.set(asset, (dst.get(asset) || 0n) + units);
+        const kind = t.backward ? 'Взыскание долга' : lender === t.from ? 'Выдача в долг' : 'Возврат долга';
+        const tx = this.record('debt', { typeName: kind, from: t.from, to: t.to, asset, amount: t.amount, title: t.title, message: t.message || '' });
+        return (await this.history(t.from, 50)).find((x) => x.signature === tx.signature);
+    }
+
+    async vouch(creator, seqNo, password) {
+        this.check(password);
+        const target = this.txs.find((t) => t.seqNo === seqNo);
+        if (!target) throw new BankError('Транзакция не найдена');
+        if (this.confirmations(target) < 1) throw new BankError('Транзакция ещё не подтверждена — заверить можно после попадания в блок');
+        this.payFee(creator);
+        target.vouches = [...(target.vouches || []), creator];
+        return this.brief(this.record('vouch', { typeName: 'Заверение', from: creator, title: 'Заверение ' + seqNo }));
     }
 
     async multiTransfer(m, password) {

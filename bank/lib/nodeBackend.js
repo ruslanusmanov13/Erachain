@@ -147,6 +147,23 @@ class NodeBackend {
         return normalizeTx(tx, t.from);
     }
 
+    // операции с долгом: выдать (lend) и вернуть (repay) — отрицательный номер актива; взыскать — ещё и backward
+    async debtTransfer(t, password) {
+        const tx = await this.call(`r_send/${t.from}/${t.to}`, {
+            query: {
+                assetKey: -Math.abs(t.asset), amount: t.amount, title: t.title, message: t.message,
+                backward: t.backward ? true : undefined, feePow: 0, encoding: 0, password,
+            },
+        });
+        return normalizeTx(tx, t.from);
+    }
+
+    // заверение (подпись второй стороной) подтверждённой транзакции по её номеру
+    async vouch(creator, seqNo, password) {
+        const tx = await this.call(`r_vouch/${creator}/${seqNo}`, { query: { feePow: 0, password } });
+        return txBrief(tx);
+    }
+
     async multiTransfer(m, password) {
         // выплаты отправляются последовательно: результат по каждой строке
         const results = [];
