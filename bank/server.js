@@ -9,6 +9,7 @@ const { NodeBackend } = require('./lib/nodeBackend');
 const { DemoBackend } = require('./lib/demoBackend');
 const { JsonStore } = require('./lib/store');
 const { Gateway } = require('./lib/bank/gateway');
+const { SevenPayClient, SevenPayDemo, SwapService } = require('./lib/sevenpay');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -34,7 +35,14 @@ const MIME = {
 function createApp(backend, options = {}) {
     const sessions = new Map(); // token -> { password, expires }; пароль только в памяти сервера
     const failures = new Map(); // ip -> { count, until } — защита от подбора пароля
-    const gateway = new Gateway(backend, options.store || new JsonStore(null, {}));
+    const store = options.store || new JsonStore(null, {});
+    const gateway = new Gateway(backend, store);
+    // обменник 7Pay: options.sevenpay — клиент API (SevenPayClient или SevenPayDemo); без него раздел выключен
+    const swap = options.sevenpay ? new SwapService(options.sevenpay, backend, store) : null;
+    const requireSwap = () => {
+        if (!swap) throw new BankError('Обменник 7Pay не подключён: задайте SEVENPAY_URL на сервере банка', 503);
+        return swap;
+    };
     const corsOrigins = new Set(options.corsOrigins || []);
 
     function openSession(password) {
@@ -203,6 +211,14 @@ function createApp(backend, options = {}) {
         ['POST', '/api/persons/certify', async ({ req, session }) => backend.certifyPerson(v.validateCertify(await readJson(req)), session.password)],
         ['GET', /^\/api\/catalog\/(statuses|templates)$/, ({ m, url }) => backend.catalog(m[1], Number(url.searchParams.get('from')) || 0)],
 
+        // обменник 7Pay
+        ['GET', '/api/swap/currencies', () => requireSwap().currencies()],
+        ['POST', '/api/swap/quote', async ({ req }) => requireSwap().quote(await readJson(req))],
+        ['GET', '/api/swap/orders', () => requireSwap().orders()],
+        ['POST', '/api/swap/orders', async ({ req }) => requireSwap().createOrder(await readJson(req))],
+        ['POST', /^\/api\/swap\/orders\/([\w-]+)\/pay$/, async ({ req, m, session }) => requireSwap().pay(m[1], await readJson(req), session.password)],
+        ['GET', /^\/api\/swap\/orders\/([\w-]+)\/history$/, ({ m }) => requireSwap().history(m[1])],
+
         // банковская интеграция
         ['GET', '/api/bank/statement', ({ url, session }) => statement(url, session)],
         ['GET', '/api/bank/settings', () => gateway.settings()],
@@ -346,6 +362,8 @@ if (require.main === module) {
             ? new JsonStore(null, { settings: demoGatewaySettings(backend) })
             : new JsonStore(path.join(dataDir, 'gateway.json'), {}),
         webhookSecret: process.env.BANK_WEBHOOK_SECRET || '',
+        sevenpay: demo ? new SevenPayDemo()
+            : process.env.SEVENPAY_URL === 'off' ? null : new SevenPayClient(process.env.SEVENPAY_URL || 'https://7pay.in'),
         corsOrigins: (process.env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
     });
     server.listen(port, host, () => {

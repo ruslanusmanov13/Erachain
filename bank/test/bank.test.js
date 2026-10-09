@@ -11,6 +11,7 @@ const { JsonStore } = require('../lib/store');
 const { Gateway } = require('../lib/bank/gateway');
 const formats = require('../lib/bank/formats');
 const v = require('../lib/validate');
+const { SevenPayClient, SevenPayDemo } = require('../lib/sevenpay');
 
 const A = '7' + 'A'.repeat(33);
 const B = '7' + 'B'.repeat(33);
@@ -22,7 +23,7 @@ function listen(server) {
 
 async function startDemo(t, options = {}) {
     const backend = new DemoBackend();
-    const server = createServer(backend, { store: new JsonStore(null, { settings: demoGatewaySettings(backend) }), ...options });
+    const server = createServer(backend, { store: new JsonStore(null, { settings: demoGatewaySettings(backend) }), sevenpay: new SevenPayDemo(), ...options });
     const base = await listen(server);
     t.after(() => server.close());
     const api = async (method, path, body, token) => {
@@ -316,4 +317,70 @@ test('NodeBackend: вызовы RPC ноды и разбор ответов', as
     await b.signDocument({ creator: A, title: 'Договор', message: '', hashes: { abc: 'f.pdf' }, recipients: [B] }, 'secret123');
     const noteBody = JSON.parse(seen.find((s) => s.path === '/r_note/make').body);
     assert.deepStrictEqual([noteBody.test, noteBody.recipients, noteBody.hashes], [false, { list: [B] }, { abc: 'f.pdf' }]);
+});
+
+test('7Pay (демо): курс, заявка BTC → ERA, оплата ERA с кошелька → BTC', async (t) => {
+    const { call, accounts, backend } = await startDemo(t);
+    const me = accounts[0].address;
+    const { data: currs } = await call('GET', '/api/swap/currencies');
+    assert.ok(currs.in.find((c) => c.abbrev === 'BTC' && !c.erachain));
+    assert.deepStrictEqual(currs.out.find((c) => c.abbrev === 'ERA').asset, 1);
+
+    const q = await call('POST', '/api/swap/quote', { from: 'BTC', to: 'ERA', amount: '0,01', side: 'in' });
+    assert.strictEqual(q.status, 200, JSON.stringify(q.data));
+    assert.ok(q.data.volumeOut > 1000 && q.data.receiveToWallet && !q.data.payFromWallet);
+    const qOut = await call('POST', '/api/swap/quote', { from: 'BTC', to: 'ERA', amount: '500', side: 'out' });
+    assert.strictEqual(qOut.data.volumeOut, 500);
+
+    assert.match((await call('POST', '/api/swap/orders', { from: 'BTC', to: 'ERA', amount: '0.01', address: 'bc1qxyz' })).data.error, /адрес ERA/);
+    const btcOrder = await call('POST', '/api/swap/orders', { from: 'BTC', to: 'ERA', amount: '0.01', address: me });
+    assert.strictEqual(btcOrder.status, 200, JSON.stringify(btcOrder.data));
+    assert.ok(btcOrder.data.addr_in && btcOrder.data.uri.startsWith('bitcoin:'));
+    assert.strictEqual(btcOrder.data.payAsset, null);
+    assert.strictEqual((await call('POST', `/api/swap/orders/${btcOrder.data.id}/pay`, { from: me })).status, 400); // BTC платится снаружи
+
+    // ERA → BTC: оплата прямо со счёта кошелька, адрес получения — в заголовке перевода
+    const btcAddr = '1BoatSLRHtKNngkdXEeobR76b53LETtpyT';
+    const eraOrder = await call('POST', '/api/swap/orders', { from: 'ERA', to: 'BTC', amount: '100', address: btcAddr });
+    assert.strictEqual(eraOrder.data.addr_out_full, 'BTC:' + btcAddr);
+    const paid = await call('POST', `/api/swap/orders/${eraOrder.data.id}/pay`, { from: me });
+    assert.strictEqual(paid.data.status, 'paid', JSON.stringify(paid.data));
+    const tx = backend.txs.find((x) => x.signature === paid.data.paySignature);
+    assert.deepStrictEqual([tx.to, tx.asset, tx.title, tx.amount], [eraOrder.data.addr_in, 1, 'BTC:' + btcAddr, '100']);
+    assert.strictEqual((await call('POST', `/api/swap/orders/${eraOrder.data.id}/pay`, { from: me })).status, 400); // второй раз нельзя
+
+    const hist = await call('GET', `/api/swap/orders/${eraOrder.data.id}/history`);
+    assert.strictEqual(hist.data.done.length, 1);
+    const { data: orders } = await call('GET', '/api/swap/orders');
+    assert.deepStrictEqual(orders.map((o) => o.status), ['done', 'awaiting_payment']);
+});
+
+test('7Pay: клиент вызывает apipay и разбирает ошибки', async (t) => {
+    const seen = [];
+    const srv = http.createServer((req, res) => {
+        seen.push(req.url);
+        const reply = (b) => res.end(JSON.stringify(b));
+        if (req.url.startsWith('/apipay/get_currs.json')) return reply({ in: { BTC: { id: 3, name: 'Bitcoin', min: 0.0001 }, ERA: { id: 9, name: 'ERA', system: 'erachain', token_key: 1 } }, out: { ERA: { id: 9, name: 'ERA', system: 'erachain', token_key: 1, bal: 1000 }, BTC: { id: 3, name: 'Bitcoin', bal: 0.5 } } });
+        if (req.url.startsWith('/apipay/get_rate.json/BTC/ERA/0.01')) return reply({ volume_in: 0.01, volume_out: 1900, rate: 190000, bal: 1000 });
+        if (req.url.startsWith('/apipay/get_uri_in.json/2/ERA/BTC/')) return reply({ volume_in: 100, volume_out: 0.0005, rate: 0.000005, addr_in: B, uri: 'erachain:' + B, addr_out_full: 'BTC:1BoatSLRHtKNngkdXEeobR76b53LETtpyT' });
+        if (req.url.startsWith('/apipay/history.json/BTC/')) return reply({ error: 'Deal ACCOUNT not found. Use ABBREV/ACCOUNT' });
+        res.statusCode = 404;
+        return reply({ error: 'not found' });
+    });
+    const base = await listen(srv);
+    t.after(() => srv.close());
+    const backend = new DemoBackend();
+    const { SwapService } = require('../lib/sevenpay');
+    const swap = new SwapService(new SevenPayClient(base), backend, new JsonStore(null, {}));
+
+    const currs = await swap.currencies();
+    assert.deepStrictEqual(currs.in.map((c) => [c.abbrev, c.erachain]), [['BTC', false], ['ERA', true]]);
+    const q = await swap.quote({ from: 'btc', to: 'era', amount: '0.01' });
+    assert.deepStrictEqual([q.volumeOut, q.available], [1900, 1000]);
+    const order = await swap.createOrder({ from: 'ERA', to: 'BTC', amount: '100', address: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT' });
+    assert.deepStrictEqual([order.payAsset, order.addr_in, order.addr_out_full], [1, B, 'BTC:1BoatSLRHtKNngkdXEeobR76b53LETtpyT']);
+    assert.ok(seen.includes('/apipay/get_uri_in.json/2/ERA/BTC/1BoatSLRHtKNngkdXEeobR76b53LETtpyT/100'));
+    assert.deepStrictEqual(await swap.history(order.id), { unconfirmed: [], inProcess: [], done: [] }); // ещё нет платежей
+    await assert.rejects(swap.quote({ from: 'DOGE', to: 'ERA', amount: '1' }), /не принимает DOGE/);
+    await assert.rejects(swap.quote({ from: 'BTC', to: 'ERA', amount: '0.02' }), /7Pay: not found/);
 });

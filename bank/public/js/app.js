@@ -16,10 +16,11 @@ import bank from './views/bank.js';
 import network from './views/network.js';
 import more from './views/more.js';
 import settings from './views/settings.js';
+import swap from './views/swap.js';
 
-const views = { home, transfer, history, assets, polls, exchange, messages, documents, persons, catalog, bank, network, more, settings };
+const views = { home, transfer, history, assets, polls, exchange, swap, messages, documents, persons, catalog, bank, network, more, settings };
 // разделы, доступные из «Сервисов», подсвечивают эту вкладку
-const navOf = { history: 'home', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
+const navOf = { history: 'home', swap: 'more', polls: 'more', exchange: 'more', messages: 'more', documents: 'more', persons: 'more', catalog: 'more', network: 'more', settings: 'more' };
 
 let renderId = 0;
 
