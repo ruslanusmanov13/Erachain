@@ -19,6 +19,7 @@ const { MarketMaker } = require('./lib/marketmaker');
 const { Anchors, canonical } = require('./lib/anchors');
 const { Lending } = require('./lib/lending');
 const { PaymentsLog } = require('./lib/paylog');
+const { SbpOnboarding } = require('./lib/sbpOnboarding');
 const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed, base58Decode, base58Encode } = require('./lib/seed');
 const { deriveAccounts } = require('./lib/erakeys');
 const { Clients } = require('./lib/clients');
@@ -130,6 +131,12 @@ function createApp(backend, options = {}) {
     const requireSbp = () => {
         if (!sbp) throw new BankError('Приём платежей по СБП не подключён: задайте TOCHKA_SBP_TOKEN и реквизиты на сервере', 503);
         return sbp;
+    };
+    // подключение ТСП в СБП «Точки» из админки
+    const onboarding = options.sbpClient && options.sbpClient.customerInfo ? new SbpOnboarding(options.sbpClient, store) : null;
+    const requireOnboarding = () => {
+        if (!onboarding) throw new BankError('СБП не подключена: задайте TOCHKA_SBP_TOKEN на сервере', 503);
+        return onboarding;
     };
     if (sbp && options.sbpIntervalMs !== 0) {
         const timer = setInterval(() => sbp.tick().catch((e) => console.error('sbp:', e.message)), options.sbpIntervalMs || 4000);
@@ -267,6 +274,7 @@ function createApp(backend, options = {}) {
             if (/\/orders\/[^/]+\/(address|retry)$/.test(pathname) || pathname === '/api/merchants/deliver') return ['gateway'];
             return ['settings'];
         }
+        if (pathname.startsWith('/api/sbp/onboarding')) return ['settings']; // подключение к СБП — администратор
         if (pathname.startsWith('/api/sbp/')) {
             if (method === 'GET') return ['read'];
             return pathname === '/api/sbp/settings' ? ['settings'] : ['gateway'];
@@ -986,6 +994,18 @@ function createApp(backend, options = {}) {
         ['POST', /^\/api\/public\/sbp\/orders\/([\w-]{36})\/emulate$/, ({ m }) => requireSbp().emulatePay(m[1]), { public: true }],
 
         // СБП: раздел сотрудников
+        ['GET', '/api/sbp/onboarding', async () => {
+            const o = requireOnboarding();
+            return { ...o.state(), active: (store.data.sbpSettings || {}).tochka || null, merchants: await o.merchants().catch(() => []) };
+        }],
+        ['POST', '/api/sbp/onboarding/customer', async ({ req }) => requireOnboarding().customer(await readJson(req))],
+        ['POST', '/api/sbp/onboarding/legal', () => requireOnboarding().registerLegal()],
+        ['POST', '/api/sbp/onboarding/account', async ({ req }) => requireOnboarding().chooseAccount(await readJson(req))],
+        ['POST', '/api/sbp/onboarding/merchant', async ({ req }) => requireOnboarding().registerMerchant(await readJson(req))],
+        ['POST', '/api/sbp/onboarding/use-merchant', async ({ req }) => requireOnboarding().useMerchant(await readJson(req))],
+        ['POST', '/api/sbp/onboarding/activate', () => requireOnboarding().activate()],
+        ['POST', '/api/sbp/onboarding/suspend', () => requireOnboarding().suspend()],
+        ['POST', '/api/sbp/onboarding/reset', () => requireOnboarding().reset()],
         ['GET', '/api/sbp/orders', () => ({ orders: requireSbp().list(), stats: requireSbp().stats() })],
         ['GET', '/api/sbp/settings', () => requireSbp().settings()],
         ['PUT', '/api/sbp/settings', async ({ req }) => requireSbp().updateSettings(await readJson(req))],

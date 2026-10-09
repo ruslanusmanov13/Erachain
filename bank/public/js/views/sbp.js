@@ -1,6 +1,7 @@
 import { get, post, put, isNative, serverUrl } from '../api.js';
 import { el, card, field, input, tabs, fmt, short, date, kv, empty, spinner, toast, copy, badge, form, qrCode, openDialog, closeDialog } from '../ui.js';
 import { state, accountSelect, can } from '../state.js';
+import { connectView } from './sbpConnect.js';
 
 const KIND = {
     SBP_ACTIVE: 'warn', SBP_DONE: 'warn', ERA_QUEUE: 'warn', ERA_SENDING: 'warn', ERA_MAKE: 'warn', ERA_SEND: 'warn', ERA_DONE: 'ok',
@@ -140,7 +141,7 @@ async function settingsView() {
 export default {
     title: 'СБП',
     async render(params) {
-        const views = { orders: ordersView, qr: newQrView, settings: settingsView };
+        const views = { orders: ordersView, qr: newQrView, settings: settingsView, connect: connectView };
         const mode = views[params[0]] ? params[0] : 'orders';
         const body = el('div', {}, spinner());
         const show = async (k) => {
@@ -153,7 +154,7 @@ export default {
         };
         show(mode);
         const items = [['orders', 'Платежи'], ['qr', 'QR для клиента']];
-        if (can('settings')) items.push(['settings', 'Настройки']);
+        if (can('settings')) items.push(['settings', 'Настройки'], ['connect', 'Подключение']);
         return el('div', {}, tabs(items, mode, show), body);
     },
 };

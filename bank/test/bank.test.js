@@ -1563,3 +1563,54 @@ test('надёжность: контрольная сумма адреса, пр
     const csv = await call('GET', '/api/payments?format=csv');
     assert.match(csv.data.toString('utf8'), /Тест журнала/);
 });
+
+test('СБП: подключение ТСП «Точки» из админки — клиент, юрлицо, счёт, ТСП, включение', async (t) => {
+    const { SbpEmulator, TochkaSbpClient } = require('../lib/sbp');
+    const sbpClient = new SbpEmulator();
+    const store = new JsonStore(null, {});
+    const { api, call } = await startDemo(t, { store, sbpClient, sbpIntervalMs: 0 });
+    assert.strictEqual((await call('POST', '/api/sbp/onboarding/legal')).status, 400, 'сначала клиент');
+    assert.strictEqual((await call('POST', '/api/sbp/onboarding/customer', { customerCode: 'abc' })).status, 400);
+    let r = await call('POST', '/api/sbp/onboarding/customer', { customerCode: '300000092', bankCode: '044525104' });
+    assert.deepStrictEqual([r.status, r.data.customer.inn, r.data.step], [200, '7701234567', 'legal']);
+    r = await call('POST', '/api/sbp/onboarding/legal');
+    assert.match(r.data.legalId, /^LF/);
+    assert.strictEqual(r.data.accounts.length, 1);
+    r = await call('POST', '/api/sbp/onboarding/account', { accountCode: r.data.accounts[0].accountCode });
+    assert.strictEqual(r.data.step, 'merchant');
+    const shop = { brandName: 'Банк Erachain', address: 'ул. Тверская, 1', city: 'Москва', region: '45', zipCode: '125009', mcc: '6012', phone: '+7 900 123-45-67' };
+    assert.strictEqual((await call('POST', '/api/sbp/onboarding/merchant', { ...shop, mcc: '60' })).status, 400);
+    r = await call('POST', '/api/sbp/onboarding/merchant', shop);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    const merchantId = r.data.merchantId;
+    r = await call('POST', '/api/sbp/onboarding/activate');
+    assert.strictEqual(r.data.step, 'done');
+    assert.deepStrictEqual(store.data.sbpSettings.tochka, { merchantId, account: '40702810900000012345', bik: '044525104' });
+    assert.strictEqual(sbpClient.merchantId, merchantId, 'реквизиты применены к приёму платежей');
+    r = await call('GET', '/api/sbp/onboarding');
+    assert.deepStrictEqual([r.data.active.merchantId, r.data.merchants.length], [merchantId, 1]);
+    assert.ok(!/"token"/i.test(JSON.stringify([store.data.sbpSettings, store.data.sbpOnboarding])), 'токен «Точки» в данных не хранится');
+    // кассир не может подключать СБП
+    const kt = (await call('POST', '/api/staff', { login: 'kassa2', role: 'operator', password: 'kassa1234' }), (await api('POST', '/api/login', { login: 'kassa2', password: 'kassa1234' })).data.token);
+    assert.strictEqual((await api('POST', '/api/sbp/onboarding/reset', {}, kt)).status, 403);
+
+    // клиент «Точки»: пути и тело запросов подключения
+    const seen = [];
+    const fake = http.createServer(async (req, res) => {
+        let b = '';
+        for await (const c of req) b += c;
+        seen.push([req.method, req.url, b ? JSON.parse(b) : null, req.headers.authorization]);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ Data: req.url.includes('register-legal-entity') ? { legalId: 'LF1' } : req.url.includes('/merchant/legal-entity/') && req.method === 'POST' ? { merchantId: 'MA1' } : {} }));
+    });
+    const base = await listen(fake);
+    t.after(() => fake.close());
+    const c = new TochkaSbpClient({ token: 'T', baseUrl: base });
+    assert.strictEqual((await c.registerLegalEntity('300000092', '044525104')).legalId, 'LF1');
+    assert.strictEqual((await c.registerMerchant('LF1', { brandName: 'X' })).merchantId, 'MA1');
+    await c.setMerchantStatus('MA1', 'Active');
+    assert.deepStrictEqual(seen.map((x) => [x.slice(0, 2), x[3]].flat()), [
+        ['POST', '/register-legal-entity', 'Bearer T'], ['POST', '/merchant/legal-entity/LF1', 'Bearer T'], ['PUT', '/merchant/MA1', 'Bearer T']]);
+    assert.deepStrictEqual(seen[0][2], { Data: { customerCode: '300000092', bankCode: '044525104' } });
+    assert.deepStrictEqual(seen[2][2], { Data: { status: 'Active' } });
+});

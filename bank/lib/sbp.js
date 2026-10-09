@@ -114,6 +114,51 @@ class TochkaSbpClient {
         const r = await this.call('GET', `/qr-codes/${qrcIds.map(encodeURIComponent).join(',')}/payment-status`);
         return ((r.Data || {}).paymentList) || [];
     }
+
+    // реквизиты приёма платежей задаются из админки (подключение ТСП); токен — только из окружения
+    configure({ merchantId, account, bik }) {
+        if (merchantId) this.merchantId = merchantId;
+        if (account) this.account = account;
+        if (bik) this.bik = bik;
+    }
+
+    // ---------- подключение к СБП: юрлицо, счёт, торговая точка (ТСП) ----------
+
+    async customerInfo(customerCode, bankCode) {
+        return (await this.call('GET', `/customer/${encodeURIComponent(customerCode)}/${encodeURIComponent(bankCode)}`)).Data || {};
+    }
+
+    async registerLegalEntity(customerCode, bankCode) {
+        return (await this.call('POST', '/register-legal-entity', { Data: { customerCode, bankCode } })).Data || {};
+    }
+
+    async legalEntity(legalId) {
+        return (await this.call('GET', `/legal-entity/${encodeURIComponent(legalId)}`)).Data || {};
+    }
+
+    async setLegalEntityStatus(legalId, status) {
+        return (await this.call('PUT', `/legal-entity/${encodeURIComponent(legalId)}`, { Data: { status } })).Data || {};
+    }
+
+    async accounts(legalId) {
+        return ((await this.call('GET', `/account/${encodeURIComponent(legalId)}`)).Data || {}).AccountList || [];
+    }
+
+    async setAccountStatus(legalId, accountCode, status) {
+        return (await this.call('PUT', `/account/${encodeURIComponent(legalId)}/${encodeURIComponent(accountCode)}`, { Data: { status } })).Data || {};
+    }
+
+    async registerMerchant(legalId, m) {
+        return (await this.call('POST', `/merchant/legal-entity/${encodeURIComponent(legalId)}`, { Data: m })).Data || {};
+    }
+
+    async merchants(legalId) {
+        return ((await this.call('GET', `/merchant/legal-entity/${encodeURIComponent(legalId)}`)).Data || {}).MerchantList || [];
+    }
+
+    async setMerchantStatus(merchantId, status) {
+        return (await this.call('PUT', `/merchant/${encodeURIComponent(merchantId)}`, { Data: { status } })).Data || {};
+    }
 }
 
 /**
@@ -139,6 +184,58 @@ class SbpEmulator {
 
     async qrInfo(qrcId) {
         return { status: this.qrs.has(qrcId) ? 'Active' : 'NotFound', commissionPercent: 0.4 };
+    }
+
+    configure(c) {
+        Object.assign(this, { merchantId: c.merchantId || this.merchantId, account: c.account || this.account, bik: c.bik || this.bik });
+    }
+
+    // подключение к СБП в демо: юрлицо, счета и ТСП живут в памяти
+    async customerInfo(customerCode, bankCode) {
+        if (!/^\d{9}$/.test(customerCode)) throw new BankError('Точка: клиент не найден', 400);
+        this.onb = this.onb || { legal: null, merchants: [] };
+        return { customerCode, bankCode, customerType: 'Business', fullName: 'ООО «Демо Шлюз»', taxCode: '7701234567', legalId: this.onb.legal && this.onb.legal.legalId };
+    }
+
+    async registerLegalEntity(customerCode) {
+        this.onb = this.onb || { legal: null, merchants: [] };
+        if (!this.onb.legal) this.onb.legal = { legalId: 'LF' + crypto.randomBytes(8).toString('hex').toUpperCase(), status: 'Active', customerCode };
+        return { legalId: this.onb.legal.legalId };
+    }
+
+    async legalEntity(legalId) {
+        return { ...this.onb.legal, legalId };
+    }
+
+    async setLegalEntityStatus(legalId, status) {
+        this.onb.legal.status = status;
+        return { status };
+    }
+
+    async accounts() {
+        return [{ accountCode: '40702810900000012345', bankCode: '044525104', status: this.onb.accountStatus || 'Active' }];
+    }
+
+    async setAccountStatus(legalId, accountCode, status) {
+        this.onb.accountStatus = status;
+        return { status };
+    }
+
+    async registerMerchant(legalId, m) {
+        const merchantId = 'MA' + crypto.randomBytes(8).toString('hex').toUpperCase();
+        this.onb.merchants.push({ merchantId, legalId, status: 'Active', ...m });
+        return { merchantId };
+    }
+
+    async merchants() {
+        return this.onb.merchants;
+    }
+
+    async setMerchantStatus(merchantId, status) {
+        const m = this.onb.merchants.find((x) => x.merchantId === merchantId);
+        if (!m) throw new BankError('Точка: ТСП не найдена', 404);
+        m.status = status;
+        return { status };
     }
 
     // ручное подтверждение оплаты (кнопка в демо)
