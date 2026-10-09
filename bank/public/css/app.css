@@ -297,3 +297,22 @@ a.list-item, a.list-item:visited { color: inherit; text-decoration: none; }
 /* широкие таблицы прокручиваются внутри, а не раздвигают карточку */
 .stack > *, form.stack > *, .card > * { min-width: 0; }
 .card { min-width: 0; overflow-wrap: anywhere; }
+
+/* сид-фраза */
+.seed-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); gap: 8px; }
+.seed-cell {
+    display: flex; align-items: baseline; gap: 6px; padding: 8px 10px; border-radius: 10px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 17px; letter-spacing: .5px; color: var(--text);
+}
+.seed-cell small { font-size: 11px; color: var(--muted); font-family: inherit; min-width: 14px; }
+.seed-input { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 16px; letter-spacing: .5px; min-height: 96px; }
+.seed-check { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.seed-check input { font-family: ui-monospace, Menlo, Consolas, monospace; text-align: center; }
+.warn-box { background: var(--warn-soft); color: var(--warn); border-radius: 10px; padding: 10px 12px; font-size: 14px; }
+.warn-box ul { margin: 6px 0 0; padding-left: 18px; }
+.choice { display: grid; gap: 10px; }
+.choice .btn { text-align: left; display: grid; gap: 2px; padding: 14px 16px; }
+.choice .btn span { font-weight: 400; font-size: 13px; opacity: .8; }
+.check-row { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; }
+.check-row input { margin-top: 3px; }

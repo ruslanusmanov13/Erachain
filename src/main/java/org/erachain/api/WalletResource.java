@@ -27,8 +27,8 @@ public class WalletResource {
     @SuppressWarnings("unchecked")
     @GET
     public String getWallet() {
-        String password = null;
-        APIUtils.askAPICallAllowed(password, "GET wallet", request, true);
+        // только признаки наличия и блокировки кошелька — без пароля, чтобы приложение могло
+        // показать мастер первого запуска на ноде без кошелька
 
         JSONObject jsonObject = new JSONObject();
 
@@ -40,9 +40,8 @@ public class WalletResource {
 
     @GET
     @Path("/seed")
-    public String getSeed() {
+    public String getSeed(@QueryParam("password") String password) {
 
-        String password = null;
         APIUtils.askAPICallAllowed(password, "GET wallet/seed", request, true);
 
         //CHECK IF WALLET EXISTS
@@ -109,16 +108,20 @@ public class WalletResource {
             //READ JSON
             JSONObject jsonObject = (JSONObject) JSONValue.parse(x);
 
-            APIUtils.askAPICallAllowed(null, "POST wallet " + x, request, true);
-
             String password = (String) jsonObject.get("password");
             String seed = (String) jsonObject.get("seed");
-            int amount = ((Long) jsonObject.getOrDefault("amount", 1L)).intValue();
+            int amount = ((Number) jsonObject.getOrDefault("amount", 1L)).intValue();
             String path = (String) jsonObject.get("dir");
 
             //CHECK IF WALLET EXISTS
             if (Controller.getInstance().doesWalletKeysExists()) {
                 throw ApiErrorFactory.getInstance().createError(ApiErrorFactory.ERROR_WALLET_ALREADY_EXISTS);
+            }
+
+            // кошелька ещё нет — защищать нечего, а без GUI запрос пароля невозможен;
+            // доступ к RPC и так ограничен списком rpcallowed
+            if (password == null || password.length() < 8) {
+                throw ApiErrorFactory.getInstance().createError(ApiErrorFactory.ERROR_WALLET_PASSWORD_SO_SHORT, "need >= 8");
             }
 
             //DECODE SEED

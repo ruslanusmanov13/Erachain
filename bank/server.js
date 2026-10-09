@@ -14,6 +14,7 @@ const { Staff, ROLES } = require('./lib/staff');
 const { SbpService, TochkaSbpClient, SbpEmulator } = require('./lib/sbp');
 const { Invoices } = require('./lib/invoices');
 const { Loans } = require('./lib/loans');
+const { OwnerKey, generateSeed, formatSeed, normalizeSeed, seedBytes, sameSeed } = require('./lib/seed');
 const formats = require('./lib/bank/formats');
 const v = require('./lib/validate');
 
@@ -44,10 +45,16 @@ function createApp(backend, options = {}) {
     const staff = new Staff(store);
     const invoices = new Invoices(backend, store);
     const loans = new Loans(backend, store);
-    // демо: готовые сотрудники и открытая смена, чтобы роли можно было опробовать сразу
+    const ownerKey = new OwnerKey(store);
+    // код первого запуска: без него чужой не создаст кошелёк, если сервер виден из сети раньше владельца
+    const setupCode = options.setupCode || null;
+    // демо: готовые сотрудники, открытая смена и привязанная сид-фраза, чтобы всё можно было опробовать сразу
     if (options.demoStaff) {
         for (const u of options.demoStaff.users) if (!store.data.staff.some((x) => x.login === u.login)) staff.create(u);
-        staff.openShift(options.demoStaff.walletPassword, staff.owner());
+        if (backend.walletExists !== false) {
+            staff.openShift(options.demoStaff.walletPassword, staff.owner());
+            if (backend.seed && !ownerKey.bound()) ownerKey.bind(backend.seed, options.demoStaff.walletPassword);
+        }
     }
     // обменник 7Pay: options.sevenpay — клиент API (SevenPayClient или SevenPayDemo); без него раздел выключен
     const swap = options.sevenpay ? new SwapService(options.sevenpay, backend, store) : null;
@@ -113,6 +120,7 @@ function createApp(backend, options = {}) {
     // права на маршрут: GET — просмотр, остальное — по разделу; список прав — все обязательны
     function permsFor(method, pathname) {
         if (pathname === '/api/logout' || pathname === '/api/me') return [];
+        if (pathname.startsWith('/api/security')) return ['wallet'];
         if (pathname.startsWith('/api/loans')) {
             if (method === 'GET' || pathname === '/api/loans/preview') return ['read'];
             if (/\/(sign|vouch|issue|repay|confiscate)$/.test(pathname)) return ['sign'];
@@ -203,12 +211,85 @@ function createApp(backend, options = {}) {
         throw new BankError('Формат: csv, 1c или camt053');
     }
 
+    async function requireNoWallet() {
+        const w = await backend.walletInfo();
+        if (w.exists) throw new BankError('Кошелёк на ноде уже создан — войдите сид-фразой или паролем', 409);
+    }
+
+    function ownerSession(password) {
+        const user = staff.owner();
+        return { token: openSession(password, user), user, shift: staff.shiftInfo() };
+    }
+
+    // неверный пароль кошелька внутри сессии — 403, а не 401: иначе приложение решит, что сессия закончилась
+    async function walletCheck(promise) {
+        try {
+            return await promise;
+        } catch (e) {
+            throw e.status === 401 ? new BankError('Неверный пароль кошелька', 403) : e;
+        }
+    }
+
+    function checkWalletPassword(password) {
+        if (typeof password !== 'string' || password.length < 8) throw new BankError('Пароль кошелька — не короче 8 символов');
+        return password;
+    }
+
     // [метод, путь (строка или RegExp), обработчик(ctx) , { public: true } для методов без сессии]
     const routes = [
         ['GET', '/api/status', () => backend.status(), { public: true }],
+
+        // первый запуск: на ноде ещё нет кошелька — создаём новый банк или восстанавливаем по сид-фразе
+        ['GET', '/api/setup', async () => {
+            const w = await backend.walletInfo();
+            return { walletExists: w.exists, seedLogin: ownerKey.bound(), needCode: !w.exists && !!setupCode };
+        }, { public: true }],
+        ['POST', '/api/setup/seed', async () => {
+            await requireNoWallet();
+            return { seed: formatSeed(generateSeed()) };
+        }, { public: true }],
+        ['POST', '/api/setup/create', async ({ req, ip }) => {
+            checkThrottle(ip);
+            const { seed, password, code } = await readJson(req);
+            await requireNoWallet();
+            if (setupCode && String(code || '').trim().toLowerCase() !== setupCode) {
+                loginFailed(ip);
+                throw new BankError('Неверный код первого запуска — он напечатан в консоли сервера банка при старте', 403);
+            }
+            seedBytes(seed); // проверка формата до обращения к ноде
+            checkWalletPassword(password);
+            const norm = normalizeSeed(seed);
+            await backend.createWallet(norm, password);
+            ownerKey.bind(norm, password);
+            failures.delete(ip);
+            return ownerSession(password);
+        }, { public: true }],
+
         ['POST', '/api/login', async ({ req, ip }) => {
             checkThrottle(ip);
-            const { login, password } = await readJson(req);
+            const { login, password, seed } = await readJson(req);
+            if (seed !== undefined) {
+                // вход владельца по сид-фразе: из неё расшифровывается пароль кошелька
+                let walletPassword;
+                try {
+                    walletPassword = ownerKey.unlock(seed);
+                } catch (e) {
+                    if (e.status !== 409) loginFailed(ip);
+                    throw e;
+                }
+                if (!walletPassword) {
+                    loginFailed(ip);
+                    throw new BankError('Сид-фраза не подходит к кошельку этого банка', 401);
+                }
+                try {
+                    await backend.login(walletPassword);
+                } catch (e) {
+                    if (e.status === 502) throw e;
+                    throw new BankError('Пароль кошелька на ноде изменился: войдите паролем кошелька и привяжите сид-фразу заново', 409);
+                }
+                failures.delete(ip);
+                return ownerSession(walletPassword);
+            }
             if (typeof password !== 'string' || !password) throw new BankError('Введите пароль');
             if (login && String(login).trim()) {
                 // вход сотрудника: свой логин и пароль, пароль кошелька не нужен
@@ -229,7 +310,7 @@ function createApp(backend, options = {}) {
                 throw e.status === 502 ? e : new BankError('Неверный пароль кошелька', 401);
             }
             failures.delete(ip);
-            return { token: openSession(password, staff.owner()), user: staff.owner(), shift: staff.shiftInfo() };
+            return ownerSession(password);
         }, { public: true }],
         ['POST', '/api/bank/webhook', async ({ req }) => {
             const raw = await readRaw(req);
@@ -258,12 +339,33 @@ function createApp(backend, options = {}) {
             try {
                 await backend.login(password);
             } catch (e) {
-                throw e.status === 502 ? e : new BankError('Неверный пароль кошелька', 401);
+                throw e.status === 502 ? e : new BankError('Неверный пароль кошелька', 403);
             }
             return staff.openShift(password, session.user);
         }],
         ['POST', '/api/shift/close', () => staff.closeShift()],
         ['GET', '/api/audit', ({ url }) => staff.auditLog(Number(url.searchParams.get('limit')) || 200)],
+
+        // сид-фраза (только владелец); каждое действие требует повторного ввода пароля кошелька
+        ['GET', '/api/security', () => ({ seed: ownerKey.info() })],
+        ['POST', '/api/security/seed/show', async ({ req }) => {
+            const { password } = await readJson(req);
+            return { seed: formatSeed(await walletCheck(backend.exportSeed(checkWalletPassword(password)))) };
+        }],
+        ['POST', '/api/security/seed/bind', async ({ req }) => {
+            const { password, seed } = await readJson(req);
+            const actual = await walletCheck(backend.exportSeed(checkWalletPassword(password)));
+            seedBytes(seed);
+            if (!sameSeed(actual, seed)) throw new BankError('Фраза не совпадает с кошельком ноды — проверьте запись');
+            return ownerKey.bind(normalizeSeed(actual), password);
+        }],
+        ['POST', '/api/security/seed/unbind', async ({ req }) => {
+            const { password } = await readJson(req);
+            await backend.login(checkWalletPassword(password)).catch((e) => {
+                throw e.status === 502 ? e : new BankError('Неверный пароль кошелька', 403);
+            });
+            return ownerKey.unbind();
+        }],
 
         // счета и переводы
         ['GET', '/api/accounts', ({ session }) => backend.accounts(session.password)],
@@ -473,8 +575,9 @@ function createApp(backend, options = {}) {
             if (!(e instanceof BankError)) console.error(e);
         }
         // журнал: все действия, кроме просмотра (GET) и запросов без входа, кроме попыток входа
-        if (req.method !== 'GET' && (session || url.pathname === '/api/login')) {
-            const user = session ? session.user : (status === 200 && body && body.user) || { login: (req.bankBody && req.bankBody.login) || 'owner?', role: '—' };
+        if (req.method !== 'GET' && (session || url.pathname === '/api/login' || url.pathname === '/api/setup/create')) {
+            const user = session ? session.user : (status === 200 && body && body.user)
+                || { login: (req.bankBody && req.bankBody.login) || (req.bankBody && req.bankBody.seed !== undefined ? 'owner (сид-фраза)' : 'owner?'), role: '—' };
             try {
                 staff.audit({ user, ip, action: `${req.method} ${url.pathname}`, body: req.bankBody, ok: status < 400, error: status < 400 ? null : body.error });
             } catch (e) {
@@ -512,6 +615,9 @@ function demoGatewaySettings(backend) {
     };
 }
 
+// демо-сид фиксированный, чтобы вход по сид-фразе можно было опробовать по README
+const DEMO_SEED = 'Ez6JELocs3iRRn5NvPo1CBh7zdtYNRUnmjokNHk66wLy';
+
 const DEMO_STAFF = {
     walletPassword: 'demo12345',
     users: [
@@ -532,7 +638,8 @@ if (require.main === module) {
     const host = process.env.HOST || '127.0.0.1';
     const rpc = process.env.ERA_RPC || 'http://127.0.0.1:9048';
     const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
-    const backend = demo ? new DemoBackend() : new NodeBackend(rpc);
+    const backend = demo ? new DemoBackend({ seed: DEMO_SEED, fresh: process.argv.includes('--fresh') }) : new NodeBackend(rpc);
+    const setupCode = demo ? null : (process.env.BANK_SETUP_CODE || crypto.randomBytes(4).toString('hex')).toLowerCase();
     const tls = process.env.TLS_CERT && process.env.TLS_KEY
         ? { cert: fs.readFileSync(process.env.TLS_CERT), key: fs.readFileSync(process.env.TLS_KEY) }
         : null;
@@ -546,6 +653,7 @@ if (require.main === module) {
             })
             : new JsonStore(path.join(dataDir, 'gateway.json'), {}),
         webhookSecret: process.env.BANK_WEBHOOK_SECRET || '',
+        setupCode,
         demoStaff: demo ? DEMO_STAFF : null,
         sbpClient: demo ? new SbpEmulator()
             : process.env.TOCHKA_SBP_TOKEN ? new TochkaSbpClient({
@@ -558,11 +666,16 @@ if (require.main === module) {
     });
     server.listen(port, host, () => {
         console.log(`Банк Erachain: ${tls ? 'https' : 'http'}://${host}:${port}`);
-        console.log(demo ? 'Демо-режим: пароль кошелька demo12345; сотрудники kassir/kassir123, buh/buh12345' : 'RPC ноды: ' + rpc);
+        console.log(demo ? `Демо-режим: сид-фраза ${formatSeed(DEMO_SEED)}; пароль кошелька demo12345; сотрудники kassir/kassir123, buh/buh12345` : 'RPC ноды: ' + rpc);
+        if (!demo) {
+            backend.walletInfo().then((w) => {
+                if (!w.exists) console.log(`На ноде нет кошелька. Откройте приложение и создайте банк. Код первого запуска: ${setupCode}`);
+            }).catch((e) => console.warn('Нода недоступна:', e.message));
+        }
         if (host !== '127.0.0.1' && host !== 'localhost' && !tls) {
             console.warn('Внимание: сервер доступен из сети без HTTPS — задайте TLS_CERT и TLS_KEY или поставьте его за HTTPS-прокси.');
         }
     });
 }
 
-module.exports = { createApp, createServer, demoGatewaySettings, DEMO_STAFF };
+module.exports = { createApp, createServer, demoGatewaySettings, DEMO_STAFF, DEMO_SEED };

@@ -672,3 +672,74 @@ test('кредиты: график, выдача в долг, погашение
     assert.deepStrictEqual([found.added, found.loan.state.restPrincipal], [1, 50]);
     assert.strictEqual((await loans.scan(l2.id, P)).added, 0); // повторно не засчитывается
 });
+
+test('сид-фраза: Base58, формат, проверка', () => {
+    const { generateSeed, formatSeed, seedBytes, sameSeed, base58Encode, base58Decode } = require('../lib/seed');
+    const seed = generateSeed();
+    assert.strictEqual(seedBytes(seed).length, 32);
+    assert.ok(sameSeed(formatSeed(seed), seed), 'группы с пробелами — та же фраза');
+    const zero = Buffer.concat([Buffer.alloc(2), crypto.randomBytes(30)]);
+    assert.deepStrictEqual(base58Decode(base58Encode(zero)), zero);
+    assert.throws(() => seedBytes('0OIl'), /недопустимые/);
+    assert.throws(() => seedBytes(seed.slice(0, 20)), /короткая/);
+    assert.throws(() => seedBytes(seed + seed), /длинная/);
+});
+
+test('первый запуск: создание банка по сид-фразе, код запуска, вход владельца по фразе', async (t) => {
+    const backend = new DemoBackend({ fresh: true });
+    const server = createServer(backend, { store: new JsonStore(null, {}), setupCode: 'abcd1234' });
+    const base = await listen(server);
+    t.after(() => server.close());
+    const api = async (method, path, body, token) => {
+        const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+        return { status: res.status, data: await res.json() };
+    };
+    let r = await api('GET', '/api/setup');
+    assert.deepStrictEqual(r.data, { walletExists: false, seedLogin: false, needCode: true });
+    assert.strictEqual((await api('POST', '/api/login', { password: 'whatever1' })).status, 401);
+    const { data: { seed } } = await api('POST', '/api/setup/seed');
+    assert.match(seed, /^(\w{4} ){10}\w{1,4}$/);
+    r = await api('POST', '/api/setup/create', { seed, password: 'secret123', code: 'wrong' });
+    assert.strictEqual(r.status, 403);
+    r = await api('POST', '/api/setup/create', { seed, password: 'short', code: 'ABCD1234' });
+    assert.match(r.data.error, /8 символов/);
+    r = await api('POST', '/api/setup/create', { seed, password: 'secret123', code: 'ABCD1234' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual(r.data.user.role, 'owner');
+    assert.strictEqual((await api('POST', '/api/setup/seed')).status, 409, 'второй раз создать нельзя');
+    assert.deepStrictEqual((await api('GET', '/api/setup')).data, { walletExists: true, seedLogin: true, needCode: false });
+
+    // вход по сид-фразе: пробелы и переносы не важны, чужая фраза не подходит
+    r = await api('POST', '/api/login', { seed: seed.replace(/ /g, '\n') });
+    assert.strictEqual(r.status, 200);
+    const token = r.data.token;
+    assert.ok((await api('GET', '/api/accounts', null, token)).data.length > 0);
+    r = await api('POST', '/api/login', { seed: require('../lib/seed').generateSeed() });
+    assert.strictEqual(r.status, 401);
+    assert.match(r.data.error, /не подходит/);
+
+    // показать фразу — только с паролем; перепривязка проверяет совпадение с кошельком
+    assert.strictEqual((await api('POST', '/api/security/seed/show', { password: 'wrongpass1' }, token)).status, 403, 'не выкидывает из сессии');
+    r = await api('POST', '/api/security/seed/show', { password: 'secret123' }, token);
+    assert.strictEqual(r.data.seed, seed);
+    r = await api('POST', '/api/security/seed/bind', { password: 'secret123', seed: require('../lib/seed').generateSeed() }, token);
+    assert.match(r.data.error, /не совпадает/);
+    r = await api('POST', '/api/security/seed/unbind', { password: 'secret123' }, token);
+    assert.strictEqual(r.data.bound, false);
+    assert.strictEqual((await api('POST', '/api/login', { seed })).status, 409);
+    r = await api('POST', '/api/security/seed/bind', { password: 'secret123', seed }, token);
+    assert.strictEqual(r.data.bound, true);
+    assert.strictEqual((await api('POST', '/api/login', { seed })).status, 200);
+});
+
+test('сид-фраза: администратор и сотрудники её не видят', async (t) => {
+    const { api, call } = await startDemo(t, { demoStaff: require('../server').DEMO_STAFF });
+    await call('POST', '/api/staff', { login: 'admin1', name: 'Админ', role: 'admin', password: 'admin12345' });
+    const { data: { token } } = await api('POST', '/api/login', { login: 'admin1', password: 'admin12345' });
+    assert.strictEqual((await api('POST', '/api/security/seed/show', { password: 'demo12345' }, token)).status, 403);
+    assert.strictEqual((await api('GET', '/api/security', null, token)).status, 403);
+    // в журнал не попадают ни фраза, ни пароль
+    await call('POST', '/api/security/seed/show', { password: 'demo12345' });
+    const audit = JSON.stringify((await call('GET', '/api/audit')).data);
+    assert.ok(audit.includes('/api/security/seed/show') && !audit.includes('demo12345'));
+});

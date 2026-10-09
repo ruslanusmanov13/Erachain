@@ -1,6 +1,7 @@
 // Точка входа: маршрутизация по #/раздел, вход в кошелёк, настройка адреса сервера.
 import { get, post, session, setUnauthorizedHandler, needsServer, isNative, serverUrl, setServerUrl } from './api.js';
-import { $, el, card, field, input, form, toast, spinner, confirm } from './ui.js';
+import { $, el, card, field, input, form, toast, spinner, confirm, tabs } from './ui.js';
+import { setupWizard, seedInput } from './seed.js';
 import { state, loadAccounts, loadMe } from './state.js';
 import home from './views/home.js';
 import transfer from './views/transfer.js';
@@ -37,7 +38,7 @@ async function render() {
     const id = ++renderId;
     const view = $('view');
     if (needsServer()) return showServerSetup();
-    if (!session.token) return showLogin();
+    if (!session.token) return showEntry();
     $('nav').classList.remove('hidden');
     const { name, params } = parseRoute();
     for (const a of $('nav').querySelectorAll('a')) a.classList.toggle('active', a.dataset.nav === (navOf[name] || name));
@@ -60,29 +61,84 @@ async function render() {
     window.scrollTo(0, 0);
 }
 
-function showLogin() {
+function loggedIn(token) {
+    session.setToken(token);
+    state.accounts = [];
+    state.me = null;
+    if (!location.hash || location.hash === '#/') location.hash = '#/home';
+    else render();
+}
+
+// какой вход показывать: мастер первого запуска (на ноде нет кошелька) или обычный вход
+async function showEntry() {
     $('nav').classList.add('hidden');
     $('pageTitle').textContent = 'Банк Erachain';
-    const f = form([
-        field('Логин сотрудника', input('login', { autocomplete: 'username', autocapitalize: 'none', placeholder: 'Пусто — вход владельца' }),
-            'Владелец входит без логина, паролем кошелька ноды'),
-        field('Пароль', input('password', { type: 'password', autocomplete: 'current-password', required: true })),
-    ], 'Войти', async (data, formEl) => {
-        const { token } = await post('login', { login: data.login.trim() || undefined, password: data.password });
-        formEl.reset();
-        session.setToken(token);
-        state.accounts = [];
-        state.me = null;
-        if (!location.hash || location.hash === '#/') location.hash = '#/home';
-        else render();
-    });
-    $('view').replaceChildren(el('div', { class: 'login-wrap' },
-        card(
-            el('h2', {}, 'Вход'),
-            el('p', { class: 'muted small' }, 'Ключи хранятся в кошельке ноды Erachain. Пароль передаётся только серверу банка и не сохраняется на устройстве.'),
+    $('view').replaceChildren(spinner());
+    let setup = { walletExists: true, seedLogin: false };
+    try {
+        setup = await get('setup');
+    } catch (e) { /* старый сервер без мастера — обычный вход */ }
+    if (session.token) return;
+    if (!setup.walletExists) {
+        $('pageTitle').textContent = 'Новый банк';
+        $('view').replaceChildren(setupWizard(setup, loggedIn), serverLine());
+    } else {
+        showLogin(setup);
+    }
+}
+
+const serverLine = () => (isNative() ? el('p', { class: 'center small muted' }, 'Сервер: ' + serverUrl() + ' · ',
+    el('a', { href: '#', onclick: (e) => { e.preventDefault(); setServerUrl(null); render(); } }, 'изменить')) : '');
+
+let loginTab = 'owner';
+
+function showLogin(setup) {
+    $('nav').classList.add('hidden');
+    $('pageTitle').textContent = 'Банк Erachain';
+    const body = el('div', {});
+    const ownerForm = (byPassword) => {
+        const f = form([
+            byPassword
+                ? field('Пароль кошелька ноды', input('password', { type: 'password', autocomplete: 'current-password', required: true }))
+                : field('Сид-фраза', seedInput('seed', { autofocus: true }), 'Фраза вводится только для входа и нигде не сохраняется'),
+        ], 'Войти', async (data, formEl) => {
+            const { token } = await post('login', byPassword ? { password: data.password } : { seed: data.seed });
+            formEl.reset();
+            loggedIn(token);
+        });
+        const toggle = el('a', { href: '#', class: 'small' }, byPassword ? 'Войти сид-фразой' : 'Войти паролем кошелька');
+        toggle.addEventListener('click', (e) => {
+            e.preventDefault();
+            body.replaceChildren(...ownerForm(!byPassword));
+        });
+        return [
+            el('p', { class: 'muted small' }, byPassword
+                ? 'Запасной вход владельца. Пароль передаётся только серверу банка и не сохраняется на устройстве.'
+                : 'Владелец банка входит сид-фразой — главным ключом кошелька. Сотрудникам она не нужна.'),
             f,
-        ),
-        isNative() ? el('p', { class: 'center small muted' }, 'Сервер: ' + serverUrl() + ' · ', el('a', { href: '#', onclick: (e) => { e.preventDefault(); setServerUrl(null); render(); } }, 'изменить')) : null,
+            setup.seedLogin || byPassword ? el('p', { class: 'center' }, toggle) : null,
+        ];
+    };
+    const staffForm = () => [
+        el('p', { class: 'muted small' }, 'Логин и пароль выдаёт владелец или администратор банка. Права зависят от роли.'),
+        form([
+            field('Логин', input('login', { autocomplete: 'username', autocapitalize: 'none', required: true })),
+            field('Пароль', input('password', { type: 'password', autocomplete: 'current-password', required: true })),
+        ], 'Войти', async (data, formEl) => {
+            const { token } = await post('login', { login: data.login.trim(), password: data.password });
+            formEl.reset();
+            loggedIn(token);
+        }),
+    ];
+    // пока сид-фраза не привязана, владелец входит паролем кошелька
+    const show = (k) => {
+        loginTab = k;
+        body.replaceChildren(...(k === 'staff' ? staffForm() : ownerForm(!setup.seedLogin)));
+    };
+    show(loginTab);
+    $('view').replaceChildren(el('div', { class: 'login-wrap' },
+        card(el('h2', {}, 'Вход'), tabs([['owner', 'Владелец'], ['staff', 'Сотрудник']], loginTab, show), body),
+        serverLine(),
     ));
 }
 
@@ -133,7 +189,7 @@ async function refreshStatus() {
 setUnauthorizedHandler(() => {
     state.accounts = [];
     state.me = null;
-    showLogin();
+    showEntry();
 });
 
 window.addEventListener('hashchange', render);

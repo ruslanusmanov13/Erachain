@@ -39,8 +39,11 @@ function fromUnits(units) {
  * опробовать без запущенной ноды. Правила упрощены (комиссия фиксирована, блок раз в 30 с).
  */
 class DemoBackend {
-    constructor({ password = 'demo12345', blockMs = 30000 } = {}) {
-        this.password = password;
+    constructor({ password = 'demo12345', blockMs = 30000, fresh = false, seed = null } = {}) {
+        // fresh — кошелька ещё нет: приложение покажет мастер первого запуска
+        this.password = fresh ? null : password;
+        this.walletExists = !fresh;
+        this.seed = fresh ? null : seed || base58(crypto.randomBytes(32));
         this.height = 1500000;
         this.accountsMap = new Map(); // address -> Map(assetKey -> units)
         this.txs = [];
@@ -128,7 +131,24 @@ class DemoBackend {
     }
 
     check(password) {
+        if (!this.walletExists) throw new BankError('Кошелёк на ноде ещё не создан', 409);
         if (password !== this.password) throw new BankError('Неверный пароль кошелька', 401);
+    }
+
+    async walletInfo() {
+        return { exists: this.walletExists, unlocked: false };
+    }
+
+    async createWallet(seed, password) {
+        if (this.walletExists) throw new BankError('Нода: wallet already exists');
+        if (typeof password !== 'string' || password.length < 8) throw new BankError('Нода: password is too short (need >= 8)');
+        Object.assign(this, { walletExists: true, seed, password });
+        return true;
+    }
+
+    async exportSeed(password) {
+        this.check(password);
+        return this.seed;
     }
 
     own(address) {

@@ -92,6 +92,30 @@ class NodeBackend {
         return true;
     }
 
+    // есть ли кошелёк на ноде (без пароля — для мастера первого запуска)
+    async walletInfo() {
+        const w = await this.call('wallet');
+        return { exists: !!w.exists, unlocked: !!w.isunlocked };
+    }
+
+    // создать кошелёк из сид-фразы (новой или для восстановления)
+    async createWallet(seed, password) {
+        const r = await this.call('wallet', { body: { seed, password, amount: 1 } });
+        if (String(r) !== 'true') throw new BankError('Нода не смогла создать кошелёк');
+        return true;
+    }
+
+    async exportSeed(password) {
+        let seed;
+        try {
+            seed = await this.call('wallet/seed', { query: { password } });
+        } catch (e) {
+            throw e.status === 502 ? e : new BankError('Неверный пароль кошелька', 401);
+        }
+        if (typeof seed !== 'string' || !seed) throw new BankError('Нода не вернула сид-фразу');
+        return seed;
+    }
+
     async assetInfo(key) {
         if (this.assetCache.has(key)) return this.assetCache.get(key);
         let info = { key, name: 'Актив #' + key, scale: 8 };

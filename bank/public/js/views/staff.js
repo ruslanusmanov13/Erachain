@@ -102,7 +102,9 @@ async function auditView() {
 }
 
 const ACTIONS = [
-    [/^POST \/api\/login$/, 'Вход'], [/^POST \/api\/logout$/, 'Выход'], [/^POST \/api\/transfer$/, 'Перевод'],
+    [/^POST \/api\/login$/, 'Вход'], [/^POST \/api\/setup\/create$/, 'Создание кошелька банка'],
+    [/^POST \/api\/security\/seed\/show$/, 'Просмотр сид-фразы'], [/^POST \/api\/security\/seed\/bind$/, 'Включён вход по сид-фразе'],
+    [/^POST \/api\/security\/seed\/unbind$/, 'Отключён вход по сид-фразе'], [/^POST \/api\/logout$/, 'Выход'], [/^POST \/api\/transfer$/, 'Перевод'],
     [/^POST \/api\/transfer\/batch$/, 'Массовая выплата'], [/^POST \/api\/accounts$/, 'Новый счёт'], [/^POST \/api\/assets$/, 'Выпуск актива'],
     [/^POST \/api\/polls$/, 'Создание голосования'], [/vote$/, 'Голос'], [/^POST \/api\/exchange\/orders$/, 'Ордер на бирже'],
     [/^POST \/api\/exchange\/cancel$/, 'Отмена ордера'], [/^POST \/api\/messages$/, 'Сообщение'], [/^POST \/api\/documents$/, 'Подпись документа'],

@@ -1,6 +1,7 @@
 import { isNative, serverUrl, setServerUrl } from '../api.js';
 import { el, card, kv, confirm } from '../ui.js';
-import { state } from '../state.js';
+import { state, can } from '../state.js';
+import { seedSettingsCard } from '../seed.js';
 
 export default {
     title: 'Настройки',
@@ -21,6 +22,7 @@ export default {
                 ['Сотрудник', state.me.user.name], ['Логин', state.me.user.login], ['Роль', state.me.role],
                 ['Смена', state.me.user.role === 'owner' ? null : (state.me.shift.open ? 'открыта' : 'закрыта')],
             ]), state.me.perms.includes('staff') ? el('a', { class: 'btn block soft', href: '#/staff' }, 'Сотрудники, смена, журнал') : null) : null,
+            can('wallet') ? await seedSettingsCard().catch((e) => card(el('h2', {}, 'Сид-фраза'), el('p', { class: 'error' }, e.message))) : null,
             card(el('h2', {}, 'Подключение'), kv([
                 ['Сервер банка', isNative() ? serverUrl() : location.origin],
                 ['Режим', s.mode === 'demo' ? 'демо' : 'нода Erachain'],
@@ -28,7 +30,7 @@ export default {
                 ['Счетов в кошельке', state.accounts.length],
             ]), change, logout),
             card(el('h2', {}, 'Безопасность'), el('p', { class: 'small muted' },
-                'Ключи хранятся только в кошельке ноды. Приложение не сохраняет пароль: он держится в памяти сервера банка до выхода или 15 минут бездействия. ' +
+                'Ключи хранятся только в кошельке ноды. Приложение не сохраняет ни сид-фразу, ни пароль: пароль кошелька держится в памяти сервера банка до выхода или 15 минут бездействия. ' +
                 'Для доступа из интернета включайте HTTPS на сервере банка.')),
             card(el('h2', {}, 'О приложении'), el('p', { class: 'small muted' }, 'Банк Erachain — клиент платформы Erachain: счета, переводы, активы, голосования, биржа, документы, персоны и интеграция с банковскими системами (1С, ISO 20022).')));
     },
